@@ -7,6 +7,13 @@ mod discovery;
 mod entry;
 mod error;
 mod event;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the endpoints and sidecar helpers get their first caller in the Phase 5 executor"
+    )
+)]
 mod internal;
 mod options;
 mod path;

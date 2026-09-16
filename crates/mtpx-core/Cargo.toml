@@ -17,7 +17,7 @@ bench-internals = []
 
 [dependencies]
 mtp-rs = { workspace = true }
-tokio = { workspace = true, features = ["sync", "fs", "time"] }
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "time"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }

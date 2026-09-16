@@ -20,7 +20,7 @@ pub type Partials = HashMap<RelPath, PartialInfo>;
 /// is `Fail` and at least one same-path entry differs.
 #[cfg_attr(
     not(any(test, feature = "bench-internals")),
-    expect(dead_code, reason = "called by the executor from Phase 4")
+    expect(dead_code, reason = "called by the Phase 5 executor")
 )]
 // pub rather than pub(crate) only so the bench-internals seam can re-export it; the module itself is private.
 pub fn plan(
