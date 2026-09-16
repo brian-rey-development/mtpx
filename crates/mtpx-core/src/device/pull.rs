@@ -26,6 +26,9 @@ const SLOW_LINK_BYTES: u64 = 1 << 30;
 impl Device {
     /// Scans `remote` and `local`, then decides what a pull would do without touching either side.
     ///
+    /// `remote` may be a directory or a single file. A directory's contents land under `local`;
+    /// a file lands directly under `local` with its own name.
+    ///
     /// Emits `ScanStarted`, `ScanProgress` and `ScanFinished` for each side, then `PlanReady`.
     ///
     /// # Errors
@@ -232,12 +235,14 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, Sender};
 
     const CAMERA: &str = "/DCIM/Camera";
+    const CAMERA_FILE: &str = "/DCIM/Camera/a.jpg";
     /// More windows than the pump can hold buffered plus in flight once the token is set,
     /// so the run cannot finish before the cancel is observed.
     const RESUME_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
 
-    async fn plan_camera<'d>(
+    async fn plan_remote<'d>(
         fixture: &'d Fixture,
+        remote: &str,
         local: &Path,
         opts: &TransferOptions,
         events: &Sender<ProgressEvent>,
@@ -245,8 +250,26 @@ mod tests {
         let cancel = CancelToken::new();
         fixture
             .device
-            .plan_pull(&device_path(CAMERA), local, opts, &cancel, events)
+            .plan_pull(&device_path(remote), local, opts, &cancel, events)
             .await
+    }
+
+    async fn plan_camera<'d>(
+        fixture: &'d Fixture,
+        local: &Path,
+        opts: &TransferOptions,
+        events: &Sender<ProgressEvent>,
+    ) -> Result<PullJob<'d>> {
+        plan_remote(fixture, CAMERA, local, opts, events).await
+    }
+
+    fn local_names(local: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(local)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     fn count(events: &[ProgressEvent], matches: impl Fn(&ProgressEvent) -> bool) -> usize {
@@ -362,6 +385,58 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn pull_of_a_single_file_lands_it_under_local_with_its_own_name() {
+        let fixture = open_device("pull-file").await;
+        seed_tree(fixture.root());
+        let local = tempfile::tempdir().unwrap();
+        let (tx, _rx) = events();
+        let opts = TransferOptions::pull();
+        let job = plan_remote(&fixture, CAMERA_FILE, local.path(), &opts, &tx)
+            .await
+            .unwrap();
+        assert_eq!(job.plan().actions(), [copy("a.jpg", 3, 0, CopyReason::New)]);
+        let report = job.run(&CancelToken::new(), &tx).await.unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(report.bytes, 3);
+        assert!(report.failed.is_empty());
+        assert_eq!(fs::read(local.path().join("a.jpg")).unwrap(), b"aaa");
+        assert_eq!(local_names(local.path()), ["a.jpg"]);
+        let second = plan_remote(&fixture, CAMERA_FILE, local.path(), &opts, &tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.plan().actions(),
+            [Action::Skip {
+                path: rel("a.jpg"),
+                reason: SkipReason::Identical
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_of_a_single_file_refuses_a_different_local_file() {
+        let fixture = open_device("pull-file-conflict").await;
+        seed_tree(fixture.root());
+        let local = tempfile::tempdir().unwrap();
+        fs::write(local.path().join("a.jpg"), b"aaaa").unwrap();
+        let (tx, _rx) = events();
+        let err = plan_remote(
+            &fixture,
+            CAMERA_FILE,
+            local.path(),
+            &TransferOptions::pull(),
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        let Error::Conflicts(paths) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(paths, vec![rel("a.jpg")]);
+        assert_eq!(fs::read(local.path().join("a.jpg")).unwrap(), b"aaaa");
     }
 
     #[tokio::test]

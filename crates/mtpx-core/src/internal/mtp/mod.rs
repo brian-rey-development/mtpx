@@ -1,10 +1,11 @@
-//! One MTP storage as a side of a transfer: listing and windowed reads, rooted at a device folder.
+//! One MTP storage as a side of a transfer: listing and windowed reads, rooted at a device folder
+//! or a single file.
 
+mod open;
 mod resolver;
 mod scan;
 
 use crate::{
-    device_path::{DevicePath, StorageSelector},
     entry::Snapshot,
     error::{Error, Result},
     internal::endpoint::{ByteStream, Endpoint, Identity, ScanResult, WriteOutcome, WriteRequest},
@@ -12,7 +13,7 @@ use crate::{
     planner::Partials,
 };
 use bytes::Bytes;
-use mtp_rs::{ByteRange, CancelToken, ObjectHandle, Storage, WindowedDownload};
+use mtp_rs::{ByteRange, CancelToken, Storage, WindowedDownload};
 use resolver::Resolver;
 use std::{fmt, io, sync::Arc};
 use tokio::{
@@ -27,33 +28,39 @@ pub const DOWNLOAD_WINDOW: u32 = 4 * 1024 * 1024;
 /// Windows the read pump may fetch ahead of the consumer.
 pub const PUMP_DEPTH: usize = 4;
 
-/// One storage on one device, rooted at a folder, as the source or destination of a transfer.
+/// One storage on one device, rooted at a folder or a single file, as the source or destination
+/// of a transfer.
 pub struct MtpEndpoint {
     storage: Arc<Storage>,
     root: RemotePath,
+    /// The file `root` names, when it is not a folder; the resolver is then rooted at its parent.
+    file: Option<String>,
     resolver: Resolver,
     identity: Identity,
 }
 
 impl MtpEndpoint {
-    /// Locates `root` on `storage`, walking one folder per segment.
+    /// Locates `root` on `storage`, walking one folder per segment. `root` may name a folder or
+    /// a file; a file endpoint scans and reads that one file under its parent.
     ///
     /// # Errors
-    /// `RemotePathNotFound` when a segment is missing, `NotADirectory` when one is a file.
+    /// `RemotePathNotFound` when a segment is missing, `NotADirectory` when a segment before the
+    /// last is a file, or the first listing error.
     pub async fn open(
         storage: Arc<Storage>,
         root: RemotePath,
         device_serial: &str,
     ) -> Result<Self> {
-        let root_handle = locate_root(&storage, &root).await?;
+        let target = open::locate_root(&storage, &root).await?;
         let identity = Identity {
             device_serial: device_serial.to_owned(),
             storage: storage.info().description.clone(),
         };
         Ok(Self {
-            resolver: Resolver::new(Arc::clone(&storage), root_handle),
+            resolver: Resolver::new(Arc::clone(&storage), target.folder),
             storage,
             root,
+            file: target.file,
             identity,
         })
     }
@@ -64,11 +71,23 @@ impl MtpEndpoint {
         &self.identity
     }
 
-    /// Lists the root's immediate children without descending into folders.
+    /// Whether the root names a single file rather than a folder.
+    #[must_use]
+    pub const fn is_file(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Lists the root's immediate children without descending into folders; a file root lists
+    /// just that file and primes the resolver with its handle, as `scan` does.
     ///
     /// # Errors
-    /// `Cancelled` once the token is set, or the listing error.
+    /// `SourceVanished` when a file root is gone, `Cancelled` once the token is set, or the
+    /// listing error.
     pub async fn list(&self, cancel: &CancelToken) -> Result<Snapshot> {
+        if self.is_file() {
+            let scanned = self.scan(cancel, Arc::new(|_| {})).await?;
+            return Ok(scanned.snapshot);
+        }
         let root = RelPath::root();
         let listing =
             scan::list_folder(&self.storage, self.resolver.root(), &root, Some(cancel)).await?;
@@ -94,7 +113,11 @@ impl Endpoint for MtpEndpoint {
         cancel: &CancelToken,
         on_found: Arc<dyn Fn(u64) + Send + Sync>,
     ) -> Result<ScanResult> {
-        let walked = scan::walk(&self.storage, self.resolver.root(), cancel, &*on_found).await?;
+        let parent = self.resolver.root();
+        let walked = match &self.file {
+            Some(name) => scan::pick_file(&self.storage, parent, name, cancel, &*on_found).await?,
+            None => scan::walk(&self.storage, parent, cancel, &*on_found).await?,
+        };
         self.resolver.prime(walked.handles);
         Ok(ScanResult {
             snapshot: Snapshot::new(self.label(), walked.entries, walked.skipped),
@@ -141,32 +164,6 @@ impl fmt::Debug for MtpEndpoint {
             .field("identity", &self.identity)
             .field("root", &self.root)
             .finish_non_exhaustive()
-    }
-}
-
-/// Walks `root` one folder per segment from the storage root; `None` means the storage root itself.
-async fn locate_root(storage: &Storage, root: &RemotePath) -> Result<Option<ObjectHandle>> {
-    let mut parent = None;
-    for segment in root.segments() {
-        let listing = storage
-            .collect_objects(parent)
-            .await
-            .map_err(Error::from_mtp)?;
-        let Some(found) = listing.objects.iter().find(|o| o.filename == *segment) else {
-            return Err(Error::RemotePathNotFound(device_path(storage, root)));
-        };
-        if !found.is_folder() {
-            return Err(Error::NotADirectory(device_path(storage, root)));
-        }
-        parent = Some(found.handle);
-    }
-    Ok(parent)
-}
-
-fn device_path(storage: &Storage, root: &RemotePath) -> DevicePath {
-    DevicePath {
-        storage: StorageSelector::Named(storage.info().description.clone()),
-        path: root.clone(),
     }
 }
 
@@ -297,6 +294,7 @@ mod tests {
     use super::{DOWNLOAD_WINDOW, MtpEndpoint, PUMP_DEPTH, test_support::*};
     use crate::{
         device_path::StorageSelector,
+        entry::EntryKind,
         error::Error,
         internal::endpoint::{Endpoint, WriteRequest},
         path::RemotePath,
@@ -304,7 +302,14 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use mtp_rs::CancelToken;
-    use std::{fs, path::Path, sync::Arc};
+    use std::{
+        fs,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     const LARGE_FILE: usize = 9 * 1024 * 1024;
     /// More windows than the pump can hold buffered plus in flight once the token is set,
@@ -369,10 +374,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_of_a_file_is_not_a_directory() {
-        let (storage, dir, serial) = open_device("open-file").await;
+    async fn open_through_a_file_is_not_a_directory() {
+        let (storage, dir, serial) = open_device("open-through-file").await;
         seed_tree(dir.path());
-        let root = remote("/DCIM/photo.jpg");
+        let root = remote("/DCIM/photo.jpg/nested");
         let err = MtpEndpoint::open(storage, root.clone(), &serial)
             .await
             .unwrap_err();
@@ -380,7 +385,108 @@ mod tests {
             panic!("{err:?}");
         };
         assert_eq!(device_path.path, root);
-        assert_eq!(device_path.to_string(), "Internal Storage:/DCIM/photo.jpg");
+        assert_eq!(
+            device_path.to_string(),
+            "Internal Storage:/DCIM/photo.jpg/nested"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_of_a_file_roots_the_endpoint_at_that_file() {
+        let (endpoint, _dir, serial) = open_at("open-file", "/DCIM/Camera/a.jpg").await;
+        assert!(endpoint.is_file());
+        assert_eq!(
+            endpoint.label(),
+            format!("{serial}:{STORAGE_DESCRIPTION}:/DCIM/Camera/a.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_of_a_folder_is_not_a_file_endpoint() {
+        let (folder, _dir, _serial) = open_at("open-folder", "/DCIM/Camera").await;
+        assert!(!folder.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_file_directly_under_the_storage_root_opens_scans_and_reads() {
+        let (storage, dir, serial) = open_device("open-root-file").await;
+        fs::write(dir.path().join("photo.jpg"), b"photo").unwrap();
+        let endpoint = MtpEndpoint::open(storage, remote("/photo.jpg"), &serial)
+            .await
+            .unwrap();
+        assert!(endpoint.is_file());
+        let result = endpoint
+            .scan(&CancelToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let listed: Vec<_> = result
+            .snapshot
+            .entries()
+            .iter()
+            .map(|e| (e.path.to_string(), e.kind, e.size))
+            .collect();
+        assert_eq!(listed, vec![("photo.jpg".to_owned(), EntryKind::File, 5)]);
+        let chunks = read_all(&endpoint, "photo.jpg", 0).await;
+        assert_eq!(chunks.concat(), b"photo");
+    }
+
+    #[tokio::test]
+    async fn scan_and_list_of_a_file_endpoint_yield_only_that_file() {
+        let (endpoint, _dir, _serial) = open_at("scan-file", "/DCIM/Camera/a.jpg").await;
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&calls);
+        let on_found = Arc::new(move |found: u64| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(found, 1);
+        });
+        let result = endpoint.scan(&CancelToken::new(), on_found).await.unwrap();
+        let listed: Vec<_> = result
+            .snapshot
+            .entries()
+            .iter()
+            .map(|e| (e.path.to_string(), e.kind, e.size))
+            .collect();
+        assert_eq!(listed, vec![("a.jpg".to_owned(), EntryKind::File, 3)]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(result.snapshot.skipped().is_empty());
+        assert!(result.partials.is_empty());
+        let list = endpoint.list(&CancelToken::new()).await.unwrap();
+        assert_eq!(list, result.snapshot);
+    }
+
+    #[tokio::test]
+    async fn read_through_a_file_endpoint_returns_its_bytes() {
+        let (endpoint, _dir, _serial) = open_at("read-file-root", "/DCIM/Camera/a.jpg").await;
+        let cold = read_all(&endpoint, "a.jpg", 0).await;
+        assert_eq!(cold.concat(), b"aaa");
+        endpoint
+            .scan(&CancelToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let primed = read_all(&endpoint, "a.jpg", 1).await;
+        assert_eq!(primed.concat(), b"aa");
+    }
+
+    #[tokio::test]
+    async fn scan_of_a_file_deleted_after_open_fails_with_source_vanished() {
+        let (endpoint, dir, _serial) = open_at("scan-file-deleted", "/DCIM/Camera/a.jpg").await;
+        fs::remove_file(dir.path().join("DCIM/Camera/a.jpg")).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&calls);
+        let on_found = Arc::new(move |_: u64| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let err = endpoint
+            .scan(&CancelToken::new(), on_found)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SourceVanished(path) if *path == rel("a.jpg")),
+            "{err:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let err = endpoint.list(&CancelToken::new()).await.unwrap_err();
+        assert!(matches!(err, Error::SourceVanished(_)), "{err:?}");
     }
 
     #[tokio::test]

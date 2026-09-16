@@ -124,6 +124,12 @@ impl Device {
         cancel: &CancelToken,
     ) -> Result<Snapshot> {
         let endpoint = self.endpoint(path).await?;
+        if endpoint.is_file() {
+            return Err(Error::NotADirectory(DevicePath {
+                storage: StorageSelector::Named(endpoint.identity().storage.clone()),
+                path: path.path.clone(),
+            }));
+        }
         if !recursive {
             return endpoint.list(cancel).await;
         }
@@ -463,15 +469,17 @@ mod tests {
             matches!(&err, Error::RemotePathNotFound(path) if path.path.to_string() == "/DCIM/Nope"),
             "{err:?}"
         );
-        let err = fixture
-            .device
-            .ls(&device_path("/DCIM/photo.jpg"), true, &cancel)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::NotADirectory(path) if path.path.to_string() == "/DCIM/photo.jpg"),
-            "{err:?}"
-        );
+        for recursive in [false, true] {
+            let err = fixture
+                .device
+                .ls(&device_path("/DCIM/photo.jpg"), recursive, &cancel)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::NotADirectory(path) if path.to_string() == "Internal Storage:/DCIM/photo.jpg"),
+                "{recursive}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

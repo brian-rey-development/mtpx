@@ -76,6 +76,7 @@ fn child_path<'a>(
     let path = parent
         .join(&info.filename)
         .map_err(|reason| reason.to_string())?;
+    // Duplicate names: first wins. Real devices never produce them; this guards broken firmware.
     if !seen.insert(&info.filename) {
         return Err(DUPLICATE_NAME.to_owned());
     }
@@ -108,6 +109,35 @@ pub(super) async fn walk(
             }
         }
     }
+    Ok(walked)
+}
+
+/// Lists `parent` once and keeps only the file named `name`, as a walk of one entry.
+///
+/// # Errors
+/// `SourceVanished` when `name` is missing or a folder: the file went away between open and
+/// scan. `Cancelled` once the token is set, or the listing error.
+pub(super) async fn pick_file(
+    storage: &Storage,
+    parent: Option<ObjectHandle>,
+    name: &str,
+    cancel: &CancelToken,
+    on_found: &(dyn Fn(u64) + Send + Sync),
+) -> Result<Walked> {
+    ensure_live(cancel)?;
+    let listing = list_folder(storage, parent, &RelPath::root(), Some(cancel)).await?;
+    // Sibling skips are deliberately dropped: a single-file pull only cares about this file's fate.
+    let found = listing
+        .children
+        .into_iter()
+        .find(|(_, info)| info.filename == name && !info.is_folder());
+    let Some((path, info)) = found else {
+        return Err(Error::SourceVanished(RelPath::new([name])?));
+    };
+    let mut walked = Walked::default();
+    walked.handles.push((path.clone(), info.handle));
+    walked.entries.push(entry_from(path, &info));
+    on_found(1);
     Ok(walked)
 }
 
