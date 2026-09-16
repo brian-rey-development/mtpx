@@ -13,6 +13,7 @@ readme = "../../README.md"
 
 [features]
 virtual-device = ["mtp-rs/virtual-device"]
+bench-internals = []
 
 [dependencies]
 mtp-rs = { workspace = true }
@@ -34,3 +35,8 @@ criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "planner"
+harness = false
+required-features = ["bench-internals"]

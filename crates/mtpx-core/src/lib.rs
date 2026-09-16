@@ -7,9 +7,11 @@ mod discovery;
 mod entry;
 mod error;
 mod event;
+mod internal;
 mod options;
 mod path;
 mod plan;
+mod planner;
 
 pub use device_path::{DevicePath, StorageSelector};
 pub use discovery::{DeviceSummary, ExclusiveHolder, StorageSummary};
@@ -20,3 +22,13 @@ pub use mtp_rs::{CancelToken, UsbSpeed};
 pub use options::{ConflictPolicy, TransferOptions};
 pub use path::{PathError, RelPath, RemotePath};
 pub use plan::{Action, CopyReason, Plan, PlanSummary, SkipReason};
+
+/// Exposes the planner and its private inputs to the Criterion benches; not part of the API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod __bench {
+    pub use crate::{
+        internal::partial::{Fingerprint, PartialInfo},
+        planner::{Partials, plan},
+    };
+}

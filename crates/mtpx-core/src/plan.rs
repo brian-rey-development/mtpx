@@ -4,6 +4,7 @@ use crate::{entry::ModifiedTime, path::RelPath};
 
 /// Why a file is going to be copied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CopyReason {
     /// The destination has no file at this path.
     New,
@@ -65,10 +66,6 @@ pub struct PlanSummary {
 }
 
 impl PlanSummary {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the planner from Phase 2")
-    )]
     fn add(mut self, action: &Action) -> Self {
         match action {
             Action::Copy {
@@ -94,10 +91,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the planner from Phase 2")
-    )]
+    /// Wraps the actions in execution order and derives their totals.
     pub(crate) fn new(actions: Vec<Action>) -> Self {
         let summary = actions
             .iter()
