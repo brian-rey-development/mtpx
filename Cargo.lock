@@ -903,11 +903,13 @@ dependencies = [
  "dialoguer",
  "humansize",
  "indicatif",
+ "jiff",
  "miette",
  "mtpx-core",
  "predicates",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
