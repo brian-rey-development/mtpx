@@ -427,7 +427,9 @@ pub(crate) enum RetryClass { Safe, Resolve, Reconcile, Never }
 | mkdir | Reconcile | re-list parent; if the folder now exists, success |
 | remove | Reconcile | re-list parent; if the object is now absent, success |
 | upload | Reconcile | delete partial handle if reported, re-stat dest; if a same-size object exists, treat as done, else retry once |
-| anything on `Disconnected`, `Cancelled`, `AccessDenied` | Never | abort the batch |
+| anything on `Disconnected`, `DeviceReset`, `NoDevice`, `PermissionDenied`, `ExclusiveAccess` | Never | abort the batch: emit `Finished` with the partial report, return `Err` |
+| anything on `Cancelled` | Never | interrupt the batch: emit `Interrupted` and `Finished`, return `Ok(report)` with `interrupted` set |
+| `AccessDenied` (per object: read-only storage, write-protected object) | Never | fail the file, continue |
 
 The executor never retries a write blindly. A lost response after `SendObjectInfo` is the classic way to create duplicates, and `Reconcile` exists for that.
 
@@ -439,7 +441,7 @@ Downloads are windowed, so no MTP session is held between windows and dropping a
 Running ──Ctrl-C──> Draining: finish the current window (at most 8 MiB, about 80 ms)
 Draining ─────────> Persisting: flush the .mtpx-part, write the sidecar with bytes so far
 Persisting ───────> Reporting: emit Interrupted { remaining_files }, then Finished { report.interrupted = true }
-Reporting ────────> Closed: close the session cleanly, return Err(Error::Cancelled)
+Reporting ────────> Closed: close the session cleanly, return Ok(report) with report.interrupted
 ```
 
 A second Ctrl-C during `Draining` exits the process immediately; the sidecar may then be behind the `.mtpx-part`, which the next run detects (`bytes` mismatch) and restarts that file.
@@ -736,3 +738,7 @@ Milestone 1 is a vertical slice that validates the dangerous assumptions on real
 - Storage is selected, never assumed, when a device has more than one.
 - Core `1.0` is decoupled from the TUI.
 - Name: `mtpx` (CLI), `mtpx-core` (library). Both free on crates.io as of 2026-09-16.
+- A cancelled run is an outcome, not an error. `run` returns `Ok(Report { interrupted: true })`; `Report.interrupted` exists for exactly this and the CLI maps it to exit 130. Only a lost device or session (`Disconnected`, `DeviceReset`, `NoDevice`, `PermissionDenied`, `ExclusiveAccess`) returns `Err`.
+- A stale handle rebuilds the whole resolver cache, not just the parent's subtree. Android re-keys every object on a media rescan, so nothing cached survives it; a subtree invalidation leaves stale grandparents in place.
+- Retries in M1 cover opening a read, and the backoff sleeps in 100 ms slices so a cancel is noticed promptly. A transient error mid-file fails that file; the sidecar lets the next run resume it. Window-level retry inside the MTP pump is M2.
+- Known risk from `mtp-rs` docs: some Android devices (Pixel) wedge after a cancelled read without reporting `DeviceReset`; the next operation hangs. M2 adds an operation timeout; M1 relies on windowed downloads, whose wedge is the recoverable one.
