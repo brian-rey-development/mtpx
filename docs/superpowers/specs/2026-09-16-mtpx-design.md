@@ -366,10 +366,16 @@ IMG_123.jpg.mtpx-part.json
 ```
 
 ```json
-{ "version": 1, "device_serial": "ZY22H5V3TK", "storage": "Internal", "source": "/DCIM/Camera/IMG_123.jpg", "size": 124124515, "modified": "2026-09-14T18:22:33Z", "bytes": 81000000 }
+{
+  "version": 1,
+  "identity": { "device_serial": "ZY22H5V3TK", "storage": "Internal shared storage" },
+  "path": "IMG_123.jpg",
+  "fingerprint": { "size": 124124515, "modified": 1757874153 },
+  "bytes": 81000000
+}
 ```
 
-Resume happens only when the fingerprint (serial, storage, source path, size, modified) equals the current source entry and the `.mtpx-part` length equals `bytes`. Otherwise the partial is discarded and the copy restarts from zero, with `CopyReason::New`. This prevents concatenating two different files that happened to share a name.
+`path` is relative to the transfer root and `modified` is Unix seconds in the device's local time. Resume happens only when `identity` matches the device the transfer talks to, `path` matches the entry, the fingerprint (size, modified) equals the current source entry, and the `.mtpx-part` length equals `bytes`. Otherwise the partial is discarded and the copy restarts from zero, with `CopyReason::New`. This prevents concatenating two different files that happened to share a name.
 
 MTP uploads are not resumable in place. `MtpEndpoint::partial` always returns `None`.
 
@@ -672,7 +678,7 @@ The goal is code a senior engineer reads once and understands. Concretely:
 - Comments only for a non-obvious why: the mtime tolerance, the windowed default, the per-file move ordering, the reconcile-before-retry rule. Nothing that restates the code.
 - No traits with one implementation, no generics without two concrete users, no `Arc<Mutex<>>` where ownership works.
 - Errors carry the data needed to render a useful message; formatting lives in the CLI.
-- `rustfmt` default with `imports_granularity = "Crate"`. `cargo deny` for licenses (MIT, Apache-2.0, BSD, ISC, Zlib) and advisories.
+- `rustfmt` default (`imports_granularity` is nightly-only, so imports are grouped by hand). `cargo deny` for licenses (MIT, Apache-2.0, BSD, ISC, Zlib) and advisories.
 - Conventional commits. `CHANGELOG.md` in Keep a Changelog format.
 - `mtpx-core` stays `0.x` until the API has proven itself across pull, push, sync, resume and move on real hardware. `1.0` is an API decision, not a UI milestone.
 
