@@ -5,12 +5,5 @@
 pub mod endpoint;
 pub mod executor;
 pub mod local;
-#[cfg_attr(
-    all(test, not(feature = "virtual-device")),
-    expect(
-        dead_code,
-        reason = "only virtual-device tests exercise the MTP endpoint until the Phase 6 device facade gives it its first non-test caller"
-    )
-)]
 pub mod mtp;
 pub mod partial;

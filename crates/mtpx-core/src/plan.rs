@@ -14,6 +14,7 @@ pub enum CopyReason {
 
 /// Why a file is left alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkipReason {
     /// Both sides already agree.
     Identical,

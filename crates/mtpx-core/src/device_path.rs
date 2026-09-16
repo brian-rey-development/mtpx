@@ -12,7 +12,8 @@ pub enum StorageSelector {
     Default,
     /// Storage by its position in the device's enumeration order.
     Index(usize),
-    /// Storage by description or volume identifier, matched case-insensitively.
+    /// Storage by description or volume identifier, matched case-insensitively; when several
+    /// match, the first in enumeration order wins.
     Named(String),
 }
 

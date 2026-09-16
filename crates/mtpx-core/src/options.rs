@@ -11,8 +11,10 @@ pub enum ConflictPolicy {
     Skip,
 }
 
-/// Options shared by every transfer command.
+/// Options shared by every transfer command; built with [`TransferOptions::pull`] or
+/// [`TransferOptions::sync`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TransferOptions {
     /// How same-path files that differ are handled.
     pub conflict: ConflictPolicy,

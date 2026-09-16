@@ -42,12 +42,6 @@ impl LocalEndpoint {
             peer,
         }
     }
-
-    /// The directory every relative path is resolved under.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
 }
 
 impl Endpoint for LocalEndpoint {

@@ -63,6 +63,22 @@ impl MtpEndpoint {
     pub const fn identity(&self) -> &Identity {
         &self.identity
     }
+
+    /// Lists the root's immediate children without descending into folders.
+    ///
+    /// # Errors
+    /// `Cancelled` once the token is set, or the listing error.
+    pub async fn list(&self, cancel: &CancelToken) -> Result<Snapshot> {
+        let root = RelPath::root();
+        let listing =
+            scan::list_folder(&self.storage, self.resolver.root(), &root, Some(cancel)).await?;
+        let entries = listing
+            .children
+            .into_iter()
+            .map(|(path, info)| scan::entry_from(path, &info))
+            .collect();
+        Ok(Snapshot::new(self.label(), entries, listing.skipped))
+    }
 }
 
 impl Endpoint for MtpEndpoint {
@@ -199,7 +215,7 @@ mod pump_tests {
 }
 
 #[cfg(all(test, feature = "virtual-device"))]
-pub(super) mod test_support {
+pub mod test_support {
     #![allow(clippy::unwrap_used)]
 
     use crate::path::{RelPath, RemotePath};
@@ -260,6 +276,18 @@ pub(super) mod test_support {
     pub fn remote(path: &str) -> RemotePath {
         RemotePath::parse(path).unwrap()
     }
+
+    pub fn pseudo_random(len: usize) -> Vec<u8> {
+        let mut state: u32 = 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & 0xFF) as u8
+            })
+            .collect()
+    }
 }
 
 #[cfg(all(test, feature = "virtual-device"))]
@@ -282,18 +310,6 @@ mod tests {
     /// More windows than the pump can hold buffered plus in flight once the token is set,
     /// so the stream cannot reach EOF before the cancel is observed.
     const CANCEL_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
-
-    fn pseudo_random(len: usize) -> Vec<u8> {
-        let mut state: u32 = 0x9E37_79B9;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state & 0xFF) as u8
-            })
-            .collect()
-    }
 
     async fn open_at(test_name: &str, root: &str) -> (MtpEndpoint, tempfile::TempDir, String) {
         let (storage, dir, serial) = open_device(test_name).await;

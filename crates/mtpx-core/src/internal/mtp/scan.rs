@@ -141,7 +141,7 @@ impl Walked {
     }
 }
 
-fn entry_from(path: RelPath, info: &ObjectInfo) -> Entry {
+pub(super) fn entry_from(path: RelPath, info: &ObjectInfo) -> Entry {
     let kind = if info.is_folder() {
         EntryKind::Dir
     } else {

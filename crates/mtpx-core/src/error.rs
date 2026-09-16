@@ -16,7 +16,8 @@ pub enum Error {
     /// More than one device is connected and none was selected. Always carries two or more.
     #[error("{} MTP devices found, pass --device", .0.len())]
     AmbiguousDevice(Vec<DeviceSummary>),
-    /// The device has several storages and none was selected. Always carries two or more.
+    /// The device has several storages and none was selected. Carries every storage the device
+    /// exposes; empty when it exposes none, as a locked phone does.
     #[error("device has {} storages, pass --storage", .0.len())]
     StorageRequired(Vec<StorageSummary>),
     /// The selected storage name or index matched nothing.

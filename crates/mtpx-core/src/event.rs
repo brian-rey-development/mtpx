@@ -33,6 +33,7 @@ pub enum Hint {
 
 /// Totals for a finished or interrupted transfer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Report {
     /// Files fully copied and verified.
     pub copied: u64,

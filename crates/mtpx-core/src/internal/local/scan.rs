@@ -321,8 +321,7 @@ mod tests {
         let result = scan(&local).await;
         assert!(result.snapshot.is_empty());
         assert!(result.partials.is_empty());
-        assert_eq!(local.root(), dir.path().join("nope"));
-        assert_eq!(local.label(), local.root().display().to_string());
+        assert_eq!(local.label(), dir.path().join("nope").display().to_string());
     }
 
     #[tokio::test]
