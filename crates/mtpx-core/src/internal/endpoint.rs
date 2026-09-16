@@ -71,6 +71,8 @@ pub trait Endpoint: Send + Sync {
     /// Streams a file from `offset` to its end.
     async fn read(&self, path: &RelPath, offset: u64, cancel: &CancelToken) -> Result<ByteStream>;
     /// Receives one file. On error the destination keeps whatever lets a later run resume.
+    /// Implementations verify the received length against `expected_size` and return
+    /// `Error::LengthMismatch` themselves, keeping the partial; the executor does not re-check.
     async fn write(&self, request: WriteRequest, input: ByteStream) -> Result<WriteOutcome>;
     /// Creates a directory and any missing parents.
     async fn mkdir(&self, path: &RelPath) -> Result<()>;

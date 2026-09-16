@@ -3,6 +3,7 @@
 // The modules are pub rather than pub(crate) so the internal tree keeps one convention:
 // `__bench` re-exports from `partial`, and a pub use out of a pub(crate) module is rejected.
 pub mod endpoint;
+pub mod executor;
 pub mod local;
 #[cfg_attr(
     all(test, not(feature = "virtual-device")),

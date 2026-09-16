@@ -11,7 +11,7 @@ mod event;
     not(test),
     expect(
         dead_code,
-        reason = "the endpoints and sidecar helpers get their first caller in the Phase 5 executor"
+        reason = "the endpoints and executor get their first caller in the Phase 6 device facade"
     )
 )]
 mod internal;

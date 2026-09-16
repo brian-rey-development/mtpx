@@ -32,11 +32,11 @@ pub enum Hint {
 }
 
 /// Totals for a finished or interrupted transfer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// Files fully copied and verified.
     pub copied: u64,
-    /// Bytes written to the destination.
+    /// Bytes streamed from the source this run.
     pub bytes: u64,
     /// Files left untouched.
     pub skipped: u64,
@@ -93,7 +93,7 @@ pub enum ProgressEvent {
     FileProgress {
         /// File being copied.
         path: RelPath,
-        /// Bytes written so far, including any resumed prefix.
+        /// Bytes streamed from the source so far, including any resumed prefix.
         bytes: u64,
     },
     /// A file copy completed and was length-verified.
