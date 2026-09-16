@@ -39,6 +39,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets --features virtual-device -- -D warnings
+      - name: Clippy (no features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --features virtual-device
       - name: Doc

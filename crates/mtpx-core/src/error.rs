@@ -86,6 +86,11 @@ impl Error {
             other => Self::Mtp(other),
         }
     }
+
+    /// Whether the device re-keyed the object behind a cached handle, so a re-listing would recover.
+    pub(crate) fn is_stale_handle(&self) -> bool {
+        matches!(self, Self::Mtp(e) if e.is_stale_handle())
+    }
 }
 
 /// Shorthand for results carrying [`Error`].
@@ -112,6 +117,13 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(format!("{:?}", Error::from_mtp(input)), expected);
         }
+    }
+
+    #[test]
+    fn is_stale_handle_only_matches_the_wrapped_mtp_variant() {
+        assert!(Error::from_mtp(mtp_rs::Error::StaleHandle).is_stale_handle());
+        assert!(!Error::from_mtp(mtp_rs::Error::Busy).is_stale_handle());
+        assert!(!Error::Cancelled.is_stale_handle());
     }
 
     #[test]
