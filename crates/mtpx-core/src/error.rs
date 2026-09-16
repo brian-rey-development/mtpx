@@ -44,8 +44,9 @@ pub enum Error {
     /// Same-path files differ and the conflict policy is `Fail`.
     #[error("conflicting files on both sides ({}); pass --overwrite or --skip-existing", .0.len())]
     Conflicts(Vec<RelPath>),
-    /// A source file disappeared between planning and copying.
-    #[error("source vanished during transfer: {0}")]
+    /// A source file disappeared after it was named: between planning and copying, or, for a
+    /// single-file pull, between opening the path and listing it.
+    #[error("source vanished: {0}")]
     SourceVanished(RelPath),
     /// The destination received a different number of bytes than the source promised.
     #[error("length mismatch for {path}: expected {expected} bytes, got {actual}")]
@@ -131,6 +132,8 @@ mod tests {
     fn list_carrying_variants_render_their_count() {
         let err = Error::StorageRequired(vec![]);
         assert_eq!(err.to_string(), "device has 0 storages, pass --storage");
+        let err = Error::AmbiguousDevice(vec![]);
+        assert_eq!(err.to_string(), "0 MTP devices found, pass --device");
     }
 
     #[test]

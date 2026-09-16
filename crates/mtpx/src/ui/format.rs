@@ -99,6 +99,7 @@ pub fn plan_line(summary: &PlanSummary) -> String {
 }
 
 /// The one line that says how a transfer ended; `remaining` is what the plan still had left.
+/// The size and rate only appear when something was copied.
 pub fn summary_line(report: &Report, remaining: u64) -> String {
     if report.interrupted {
         return format!(
@@ -109,19 +110,32 @@ pub fn summary_line(report: &Report, remaining: u64) -> String {
         );
     }
     format!(
-        "Done in {}: {} copied ({}, {} avg), {} skipped, {} failed",
+        "Done in {}: {} copied{}, {} skipped, {} failed",
         duration(report.elapsed),
         count(report.copied),
-        size(report.bytes),
-        rate(report.bytes, report.elapsed),
+        copied_detail(report),
         count(report.skipped),
         count(report.failed.len() as u64)
     )
 }
 
+fn copied_detail(report: &Report) -> String {
+    if report.copied == 0 {
+        return String::new();
+    }
+    format!(
+        " ({}, {} avg)",
+        size(report.bytes),
+        rate(report.bytes, report.elapsed)
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
+    use mtpx_core::RelPath;
 
     #[test]
     fn counts_get_thousands_separators() {
@@ -224,6 +238,23 @@ mod tests {
         assert_eq!(
             summary_line(&report, 177),
             "Interrupted after 1m 03s: 5 copied, 177 remaining, re-run to resume"
+        );
+    }
+
+    #[test]
+    fn summary_line_drops_the_size_and_rate_when_nothing_was_copied() {
+        let mut report = Report::default();
+        report.skipped = 2;
+        assert_eq!(
+            summary_line(&report, 0),
+            "Done in 0s: 0 copied, 2 skipped, 0 failed"
+        );
+        report
+            .failed
+            .push((RelPath::new(["a.jpg"]).unwrap(), "boom".into()));
+        assert_eq!(
+            summary_line(&report, 0),
+            "Done in 0s: 0 copied, 2 skipped, 1 failed"
         );
     }
 }

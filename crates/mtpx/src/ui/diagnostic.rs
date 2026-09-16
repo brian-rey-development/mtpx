@@ -1,6 +1,9 @@
 //! Turns a core error into a miette report with the help text the situation calls for.
 
-use crate::ui::prompt::{device_item, storage_item};
+use crate::ui::{
+    format,
+    prompt::{device_item, storage_item},
+};
 use mtpx_core::{DevicePath, DeviceSummary, Error, ExclusiveHolder, RelPath, StorageSummary};
 
 const NO_DEVICE_HELP: &str =
@@ -80,17 +83,24 @@ fn storage_required(storages: &[StorageSummary]) -> String {
 }
 
 fn conflicts(paths: &[RelPath]) -> String {
-    let mut lines: Vec<String> = paths
-        .iter()
-        .take(MAX_LISTED_CONFLICTS)
-        .map(|path| format!("  {path}"))
-        .collect();
+    let mut lines = vec![conflicts_heading(paths.len())];
+    lines.extend(
+        paths
+            .iter()
+            .take(MAX_LISTED_CONFLICTS)
+            .map(|path| format!("  {path}")),
+    );
     let more = paths.len().saturating_sub(MAX_LISTED_CONFLICTS);
     if more > 0 {
         lines.push(format!("  ... and {more} more"));
     }
     lines.push(CONFLICTS_HELP.to_owned());
     lines.join("\n")
+}
+
+fn conflicts_heading(count: usize) -> String {
+    let verb = if count == 1 { "differs" } else { "differ" };
+    format!("{} {verb}:", format::files(count as u64))
 }
 
 fn remote_path_not_found(path: &DevicePath) -> String {
@@ -131,15 +141,23 @@ mod tests {
     }
 
     #[test]
-    fn conflicts_help_lists_the_paths_and_both_flags() {
+    fn conflicts_help_counts_the_files_then_lists_them_then_names_both_flags() {
         let paths = vec![
             RelPath::new(["a.jpg"]).unwrap(),
             RelPath::new(["b.jpg"]).unwrap(),
         ];
         let text = help(&Error::Conflicts(paths)).unwrap();
-        assert!(text.contains("  a.jpg\n  b.jpg\n"), "{text}");
-        assert!(text.contains("--overwrite"), "{text}");
-        assert!(text.contains("--skip-existing"), "{text}");
+        assert_eq!(
+            text,
+            "2 files differ:\n  a.jpg\n  b.jpg\n\
+             use --overwrite to replace them or --skip-existing to leave them"
+        );
+    }
+
+    #[test]
+    fn conflicts_help_reads_singular_for_one_file() {
+        let text = help(&Error::Conflicts(vec![RelPath::new(["a.jpg"]).unwrap()])).unwrap();
+        assert!(text.starts_with("1 file differs:\n  a.jpg\n"), "{text}");
     }
 
     #[test]
@@ -148,7 +166,12 @@ mod tests {
             .map(|i| RelPath::new([format!("{i}.jpg")]).unwrap())
             .collect();
         let text = help(&Error::Conflicts(paths)).unwrap();
-        assert!(text.contains("... and 5 more"), "{text}");
+        assert!(text.starts_with("25 files differ:\n  0.jpg\n"), "{text}");
+        assert!(
+            text.contains("  19.jpg\n  ... and 5 more\nuse --overwrite"),
+            "{text}"
+        );
+        assert!(!text.contains("  20.jpg"), "{text}");
     }
 
     #[test]
