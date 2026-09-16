@@ -1,0 +1,5 @@
+/target
+*.mtpx-part*
+.DS_Store
+.idea/
+.vscode/

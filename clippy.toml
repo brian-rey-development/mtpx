@@ -1,0 +1,2 @@
+# Test modules may opt out with #![allow(clippy::too_many_lines)] at the module level.
+too-many-lines-threshold = 20

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/mtpx-core", "crates/mtpx"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/brianrey/mtpx"
+authors = ["Brian Rey"]
+
+[workspace.dependencies]
+mtpx-core = { path = "crates/mtpx-core", version = "0.1.0" }
+
+mtp-rs = "0.32"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0.1"
+futures = "0.3"
+bytes = "1.12"
+thiserror = "2.0"
+serde = "1.0"
+serde_json = "1.0"
+filetime = "0.2"
+jiff = "0.2"
+walkdir = "2.5"
+tracing = "0.1"
+
+clap = "4.6"
+indicatif = "0.18"
+console = "0.16"
+dialoguer = "0.12"
+miette = "7.6"
+humansize = "2.1"
+tracing-subscriber = "0.3"
+
+tempfile = "3.27"
+criterion = "0.7"
+assert_cmd = "2.2"
+predicates = "3.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+module_name_repetitions = "allow"
