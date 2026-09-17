@@ -332,34 +332,39 @@ async fn open_part(part: &Path, resume_from: u64) -> Result<File> {
     Ok(file)
 }
 
-/// Opens an existing part for appending at `resume_from`. The length is re-checked through the
+/// Opens an existing part positioned at `resume_from`. The length is re-checked through the
 /// handle, not the path, so a part replaced between the probe and the open fails here instead
 /// of landing a hole in the final file; an unverified tail past the checkpoint is dropped.
 async fn open_resumed(part: &Path, resume_from: u64) -> Result<File> {
-    let file = OpenOptions::new()
-        .append(true)
+    // Plain write access, not append: Windows grants an append handle no right to truncate.
+    let mut file = OpenOptions::new()
+        .write(true)
         .open(part)
         .await
         .map_err(Error::local_io("open", part))?;
-    if on_disk_len(&file, part).await? < resume_from {
-        let changed = io::Error::new(
-            io::ErrorKind::InvalidData,
-            "partial file changed while opening",
-        );
-        return Err(Error::local_io("open", part)(changed));
-    }
+    ensure_still_holds(&file, part, resume_from).await?;
     file.set_len(resume_from)
         .await
         .map_err(Error::local_io("truncate", part))?;
+    file.seek(SeekFrom::Start(resume_from))
+        .await
+        .map_err(Error::local_io("seek", part))?;
     Ok(file)
 }
 
-async fn on_disk_len(file: &File, part: &Path) -> Result<u64> {
+async fn ensure_still_holds(file: &File, part: &Path, resume_from: u64) -> Result<()> {
     let meta = file
         .metadata()
         .await
         .map_err(Error::local_io("stat", part))?;
-    Ok(meta.len())
+    if meta.len() >= resume_from {
+        return Ok(());
+    }
+    let changed = io::Error::new(
+        io::ErrorKind::InvalidData,
+        "partial file changed while opening",
+    );
+    Err(Error::local_io("open", part)(changed))
 }
 
 async fn discard_partial(final_path: &Path, error: Error) -> Result<()> {
