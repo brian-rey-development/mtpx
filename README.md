@@ -8,12 +8,11 @@ rsync for your phone: fast, incremental file transfers over MTP, in pure Rust
 
 ## Status
 
-Milestone 1 is feature complete: `devices`, `ls`, `pull`, `sync`, `--dry-run`, and resumable
-transfers that survive Ctrl-C and a pulled cable. It is validated on a Motorola moto g52
-(2,214 files, 12.5 GB, interrupted and resumed); the record is in
-[docs/hardware-runs/2026-09-16-moto-g52.md](docs/hardware-runs/2026-09-16-moto-g52.md) and
-the procedure in [docs/manual-checklist.md](docs/manual-checklist.md). Nothing is released
-yet and the CLI surface may still change before 0.1.0.
+Pre-release. What works today: `devices`, `ls`, `pull`, `sync`, `--dry-run`, and resumable
+transfers that survive Ctrl-C and a pulled cable. Tested against a Motorola moto g52 (2,214
+files, 12.5 GB, interrupted and resumed; the log is in
+[docs/hardware-runs](docs/hardware-runs/2026-09-16-moto-g52.md)). Push, delete and move
+are not implemented, and the CLI surface may still change before 0.1.0.
 
 ## Why
 
@@ -46,8 +45,8 @@ sudo udevadm control --reload-rules
 macOS claims MTP devices for Image Capture through `ptpcamerad`; if `mtpx` reports the
 device is held by another process, `pkill ptpcamerad` releases it for the session.
 
-Windows builds and is tested in CI; `mtp-rs` uses the native Windows Portable Devices
-stack there, so no driver is needed, but 0.1.0 has not been validated on Windows hardware.
+On Windows, `mtp-rs` goes through Windows Portable Devices, so no driver is needed. The
+test suite passes there in CI, but nobody has run it against a real phone on Windows yet.
 
 ## Quick start
 
@@ -91,7 +90,7 @@ and `TERM=dumb` gets plain lines and no prompts. `-v` sets the log level outrigh
 | present | same size | skipped |
 | present | different size | `sync`: replaced; `pull`: refused unless `--overwrite` or `--skip-existing` |
 | file | directory, or vice versa | skipped as a kind conflict, together with everything beneath a directory; never replaced by deleting |
-| absent | present | left alone (nothing is ever deleted in this milestone) |
+| absent | present | left alone; nothing is ever deleted |
 
 Files are compared by size. MTP devices report modification times inconsistently, so a
 same-size file counts as unchanged; that is the same trade-off `rsync --size-only` makes.
@@ -166,7 +165,8 @@ scan local ──┘
 
 Downloads are windowed: each 4 MiB window is one MTP transaction, nothing is held
 between windows, and the USB producer runs ahead of the disk writer through a bounded
-channel. That is what makes cancellation and resume safe by construction.
+channel. Cancelling between two windows therefore never leaves a half-written window, which
+is what makes resume a matter of bookkeeping rather than luck.
 
 ## Development
 

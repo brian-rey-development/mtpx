@@ -1,7 +1,6 @@
 # Contributing to mtpx
 
-Thanks for considering a contribution. This project aims for senior-level,
-review-ready code on every merge. By participating you agree to the
+Thanks for considering a contribution. By participating you agree to the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Setup
@@ -74,9 +73,8 @@ cargo deny check
 
 ## Hardware validation
 
-Some changes need a real phone. `docs/manual-checklist.md` is the step by
-step procedure; record your results, paste them into the PR and add a file
-under `docs/hardware-runs/`.
+Some changes need a real phone. `docs/manual-checklist.md` is the procedure;
+record the results in a file under `docs/hardware-runs/` and link it from the PR.
 
 ## License
 

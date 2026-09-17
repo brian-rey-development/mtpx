@@ -36,10 +36,10 @@ scan local ──┘
 
 Downloads are windowed: each 4 MiB window is one MTP transaction, nothing is held
 between windows, and the USB producer runs ahead of the disk writer through a bounded
-channel. That is what makes cancellation and resume safe by construction. A file in flight
-is `name.mtpx-part` next to a JSON sidecar that records which device and storage it came
-from, the size and modification time the phone reported, and how many bytes landed; the
-next plan resumes only when all of that still matches.
+channel, so cancelling between two windows never leaves a half-written window. A file in
+flight is `name.mtpx-part` next to a JSON sidecar that records which device and storage it
+came from, the size and modification time the phone reported, and how many bytes landed;
+the next plan resumes only when all of that still matches.
 
 ## Features
 
