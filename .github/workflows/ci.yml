@@ -25,7 +25,7 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Bare `rustup toolchain install` reads rust-toolchain.toml (rustup 1.28+), so CI lints
       # with the same pinned clippy developers run locally instead of whatever stable is.
       - name: Install the pinned toolchain
@@ -48,7 +48,7 @@ jobs:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   msrv:
@@ -62,7 +62,7 @@ jobs:
       # rust-toolchain.toml would otherwise override the toolchain the action installs.
       RUSTUP_TOOLCHAIN: "1.85"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - name: Build
