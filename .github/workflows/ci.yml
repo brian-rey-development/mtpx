@@ -26,20 +26,18 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install libudev
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Bare `rustup toolchain install` reads rust-toolchain.toml (rustup 1.28+), so CI lints
+      # with the same pinned clippy developers run locally instead of whatever stable is.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
-      - name: Clippy
+      - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Clippy (default features)
+      - name: Clippy (virtual-device)
         run: cargo clippy --workspace --all-targets --features virtual-device -- -D warnings
-      - name: Clippy (no features)
+      - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --features virtual-device
@@ -60,12 +58,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
+    env:
+      # rust-toolchain.toml would otherwise override the toolchain the action installs.
+      RUSTUP_TOOLCHAIN: "1.85"
     steps:
       - uses: actions/checkout@v4
-      - name: Install libudev
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace --all-targets --features virtual-device
+        run: cargo build --workspace --all-targets --all-features

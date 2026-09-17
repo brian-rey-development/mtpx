@@ -7,40 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### M1 hardware validation (2026-09-16, Motorola moto g52, macOS, USB 2.0 High Speed)
-
-- Camera folder of 2,214 files, 12.5 GB: one run interrupted with Ctrl-C after 36 s
-  (457 files copied, exit 130, one partial with its sidecar), one resume run that
-  finished the remaining 1,757 files in 6m 15s at 30.1 MB/s average, 0 failed,
-  no part files left, sizes and modification times equal to the phone's.
-- A second interrupt cut a 9 MB photo at two windows; the next run resumed it from
-  8.4 MB and the result is byte-exact.
-- Rerun on a synced folder: 0 copied, 2,214 skipped.
-- Listing is one metadata request per object: 2,214 objects took 9 s right after
-  unlocking and 39 s later, so scan time depends on the phone's state.
-- Eight fixes came out of the run; see `docs/manual-checklist.md`.
-
-### Fixed
-
-- A cancel that lands after a file's last window finishes the file instead of failing it.
-- A complete partial is finalised in place instead of being copied again.
-- A phone that does not answer (locked, charging-only) is reported as unresponsive
-  with the way out, exit 3.
-- Errors and hints show the path as typed, without an unrequested storage prefix.
-- `mtpx ls | head` ends quietly instead of panicking on the closed pipe.
-- The summary times the whole command; a dry run lists only what would change;
-  an interrupt during the scan prints one plain line.
-
 ### Added
 
-- `mtpx devices`, `ls` (`-l`, `-R`), `pull` (`--overwrite`, `--skip-existing`, `--dry-run`)
-  and `sync` (`--dry-run`), with two progress bars on a terminal and one line per file
-  elsewhere, plain tables on stdout, a help line per error, and the documented exit codes.
-- `mtpx-core`: `Device` facade (`open`, `ls`, `plan_pull`, `close`), `PullJob`, a pure
-  planner with `ConflictPolicy`, fingerprinted resume through `.mtpx-part` files and JSON
-  sidecars, windowed MTP downloads with cooperative cancellation, transparent recovery
-  from re-keyed object handles, and read retries with backoff.
+- `mtpx devices`, `ls` (`-l`/`--long`, `-R`/`--recursive`), `pull` (`--overwrite`,
+  `--skip-existing`, `--dry-run`) and `sync` (`--dry-run`): two progress bars on a terminal,
+  one line per file elsewhere, plain tables on stdout, a help line per error, and exit codes
+  a script can branch on (`mtpx --help` lists them). Global flags: `--device` (index or USB
+  serial, `serial:` prefix for an all-digit serial), `--storage`, `-q`, `-v` up to `-vvv`
+  (overrides `RUST_LOG`), `--no-color`, `--no-interactive`.
 - Single-file pulls: `mtpx pull /DCIM/Camera/IMG_0001.jpg ~/Desktop`.
-- `virtual-device` feature: the whole pull, resume and CLI path runs in tests without a phone.
-- Workspace scaffolding: `mtpx-core` library crate and `mtpx` CLI crate.
-- CI on macOS, Ubuntu and Windows: fmt, clippy, test, doc, cargo-deny, MSRV build.
+- Sync semantics, documented on `TransferOptions` and in the README: equality is kind plus
+  size (timestamps ignored, like `rsync --size-only`); a file on one side and a directory on
+  the other is skipped as a kind conflict together with everything beneath it, never replaced
+  by deleting; on a case-folding destination (macOS, Windows) names are matched
+  case-insensitively and source names that collide are reported instead of merged.
+- Resume: a file in flight is `name.mtpx-part` plus a JSON sidecar keyed by device serial,
+  storage, size and modification time, checkpointed every 64 MiB and finalised by rename, so
+  a name without the suffix is always complete. Ctrl-C finishes the current 4 MiB window and
+  exits 130 with the count of files remaining; a lost device or a full disk ends the run
+  with an `Aborted after ...` line and the partial kept. The next run resumes or starts
+  over, never splices.
+- Diagnostics: a locked or charging-only phone is reported as unresponsive with the way
+  out; `--device` and `--storage` selectors that match nothing list what is attached;
+  objects the phone refuses to describe are counted as `left out` and listed by folder;
+  the summary times the whole command; `mtpx ls | head` ends quietly.
+- `mtpx-core`: `Device` facade (`open`, `ls`, `plan_pull`, `close`), `PullJob`, a pure
+  planner with `ConflictPolicy`, fingerprinted resume, windowed MTP downloads with
+  cooperative cancellation, transparent recovery from re-keyed object handles, read retries
+  with backoff, and an event stream that ends with `Finished`, or `Aborted` when the run
+  returns an error. Result types are `#[non_exhaustive]` with constructors; `MtpError`,
+  `MtpDateTime`, `CancelToken` and `UsbSpeed` are re-exported from `mtp-rs` 0.32, which is
+  therefore a public dependency.
+- `virtual-device` feature: the whole pull, resume and CLI path runs in tests without a
+  phone, and the hidden `--virtual <dir>` flag drives the real binary against it.
+
+### Security
+
+- Device-controlled text (device labels and serials, storage names, file names) is
+  sanitized before display, including bidi controls and line separators, so terminal
+  escape sequences from a malicious descriptor or file name cannot reach tables, prompts,
+  progress lines, or diagnostics. On Windows, names Win32 would reinterpret (`:`, trailing
+  dots, `CON`, `COM1`) are refused as invalid paths.
+
+[Unreleased]: https://github.com/brian-rey-development/mtpx/commits/main

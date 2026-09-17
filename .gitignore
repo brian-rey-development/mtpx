@@ -1,5 +1,7 @@
 /target
 *.mtpx-part*
+*.log
+.env
 .DS_Store
 .idea/
 .vscode/

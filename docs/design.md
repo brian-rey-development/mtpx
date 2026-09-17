@@ -4,6 +4,10 @@ Status: revision 2, for review
 Date: 2026-09-16
 Author: Brian Rey (with Claude)
 
+This is the target design. Section 14 says which milestone each capability belongs to; only
+M1 has shipped. Where this document and the code disagree, the code wins and the CHANGELOG
+records what shipped.
+
 Revision 2 incorporates an external design review. The main changes: MTP handles no longer leak into snapshots or plans, the endpoint abstraction is transfer-shaped instead of filesystem-shaped, resume is fingerprinted, retries are classified per operation, deletes are post-order, sync policy is split into compare / conflict / delete, the public API is narrowed to a facade, JSON output is a versioned contract separate from the internal event enum, cancellation is a state machine built on windowed downloads, `doctor --fix` is reversible, storage selection is a separate concept from paths, and v0.1 is a vertical slice validated on real hardware before polish.
 
 ## 1. Summary
@@ -53,6 +57,8 @@ Tagline: "rsync for your phone. Fast, incremental file transfers over MTP, in pu
 
 ### 5.1 Workspace layout
 
+Target layout across all milestones; M1 ships a subset of it.
+
 ```text
 mtpx/
 ├── Cargo.toml                  workspace, shared lints, shared deps
@@ -70,7 +76,7 @@ mtpx/
 │   ├── cli.md                  full command reference, JSON schema, exit codes
 │   ├── sync-semantics.md       what sync does and does not do
 │   ├── troubleshooting.md      macOS ptpcamerad, Linux udev, Windows notes
-│   └── superpowers/specs/      this document
+│   └── design.md               this document
 └── crates/
     ├── mtpx-core/
     │   ├── Cargo.toml
@@ -169,7 +175,7 @@ scan(dest)   ─┘                                                     │
 
 ### 6.1 Public surface
 
-Only these are `pub`. Everything under `internal/` is `pub(crate)`. Public structs and enums that may grow are `#[non_exhaustive]`. `#![deny(missing_docs)]`, `#![forbid(unsafe_code)]`.
+Only these are `pub`. Everything under `internal/` is `pub(crate)`. Public structs and enums that may grow are `#[non_exhaustive]`. `missing_docs = "warn"` at the workspace, which CI's `-D warnings` turns into an error, so every public item carries a one-line doc stating its contract; `#![forbid(unsafe_code)]`.
 
 ```rust
 pub use device::{Device, DeviceSelector, OpenOptions};
@@ -189,28 +195,41 @@ The `Endpoint` trait stays private until `pull`, `push`, `sync`, resume and move
 
 ### 6.2 Facade
 
+Shipped in M1:
+
 ```rust
 pub struct Device { /* session, storages, resolver cache */ }
 
 impl Device {
-    pub async fn open(selector: &DeviceSelector, opts: &OpenOptions) -> Result<Self>;
-    pub fn info(&self) -> &DeviceInfo;
-    pub fn storages(&self) -> &[StorageSummary];
+    pub async fn open(selector: &DeviceSelector) -> Result<Self>;
+    pub const fn summary(&self) -> &DeviceSummary;
+    pub fn storages(&self) -> Vec<StorageSummary>;
 
     pub async fn ls(&self, path: &DevicePath, recursive: bool, cancel: &CancelToken) -> Result<Snapshot>;
 
-    pub async fn plan(&self, dir: Direction, remote: &DevicePath, local: &Path, opts: &TransferOptions, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Plan>;
-
-    pub async fn transfer(&self, plan: &Plan, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Report>;
-
-    pub async fn remove(&self, path: &DevicePath, recursive: bool, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Report>;
-    pub async fn mkdir(&self, path: &DevicePath) -> Result<()>;
+    pub async fn plan_pull<'d>(&'d self, remote: &DevicePath, local: &Path, opts: &TransferOptions, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<PullJob<'d>>;
 
     pub async fn close(self) -> Result<()>;
 }
+
+impl PullJob<'_> {
+    pub const fn plan(&self) -> &Plan;
+    pub async fn run(self, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Report>;
+}
 ```
 
-`plan` emits `ScanStarted`, `ScanProgress`, `ScanFinished` and `PlanReady`. `transfer` emits the per-file events and `Finished`. A `--dry-run` is `plan` without `transfer`.
+`plan_pull` emits `ScanStarted`, `ScanProgress`, `ScanFinished` and `PlanReady`. `run` emits the per-file events and ends with `Finished`, or `Aborted` when it returns `Err`. A `--dry-run` is `plan_pull` without `run`.
+
+Planned (M2/M3), shape not final:
+
+```rust
+impl Device {
+    pub async fn plan(&self, dir: Direction, remote: &DevicePath, local: &Path, opts: &TransferOptions, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Plan>;
+    pub async fn transfer(&self, plan: &Plan, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Report>;
+    pub async fn remove(&self, path: &DevicePath, recursive: bool, cancel: &CancelToken, events: &Sender<ProgressEvent>) -> Result<Report>;
+    pub async fn mkdir(&self, path: &DevicePath) -> Result<()>;
+}
+```
 
 ### 6.3 Paths and storage selection
 
@@ -337,9 +356,10 @@ pub enum ProgressEvent {
     Skipped { path: RelPath, reason: SkipReason },
     Interrupted { remaining_files: u64 },
     Finished { report: Report },
+    Aborted { report: Report, remaining_files: u64 },
 }
 
-pub enum Hint { SlowLink { speed: UsbSpeed, bytes: u64 }, DeviceSkippedObjects { count: usize } }
+pub enum Hint { SlowLink { bytes: u64 }, DeviceSkippedObjects { skipped: Vec<SkippedEntry> }, StalePartials { count: u64, bytes: u64 } }
 
 pub struct Report { pub copied: u64, pub bytes: u64, pub skipped: u64, pub deleted: u64, pub failed: Vec<(RelPath, String)>, pub elapsed: Duration, pub interrupted: bool }
 ```
@@ -351,7 +371,7 @@ Copy loop for one file:
 1. `dest.partial(path)` returns the sidecar if present; the planner already decided `resume_from`.
 2. `source.read(path, resume_from)` returns a `ByteStream`. For MTP this resolves the handle now, not at plan time.
 3. `dest.write(WriteRequest { path, expected_size, resume_from, modified }, stream)` pumps chunks through a bounded channel (depth 8, 1 MiB chunks). The USB side fills it, the disk side drains it in `spawn_blocking`. `FileProgress` at most every 100 ms.
-4. `write` returns `WriteOutcome { bytes }`. The executor checks `bytes == expected_size`. A mismatch is `Error::LengthMismatch`; the partial is kept, the file is reported failed.
+4. `write` verifies that exactly `expected_size` bytes landed and returns `Ok(())`. A mismatch is `Error::LengthMismatch`; the partial is kept, the file is reported failed.
 5. With `delete_source_after_verify`, `source.remove(path)` now, then `Deleted { side: Source }`.
 
 Guarantees, stated precisely: local destinations use atomic temp-file replacement. Remote destinations use the strongest commit the device supports: an upload creates the object then streams data, and a failed data phase deletes the partial object `mtp-rs` reports. Every transfer is length-verified. Length verification is not integrity verification; `push --verify` (read back and compare) is the integrity option.
@@ -375,7 +395,7 @@ IMG_123.jpg.mtpx-part.json
 }
 ```
 
-`path` is relative to the transfer root and `modified` is Unix seconds in the device's local time. Resume happens only when `identity` matches the device the transfer talks to, `path` matches the entry, the fingerprint (size, modified) equals the current source entry, and the `.mtpx-part` length equals `bytes`. Otherwise the partial is discarded and the copy restarts from zero, with `CopyReason::New`. This prevents concatenating two different files that happened to share a name.
+`path` is relative to the transfer root and `modified` is Unix seconds in the device's local time. Resume happens only when `identity` matches the device the transfer talks to, `path` matches the entry, the fingerprint (size, modified) equals the current source entry, and the `.mtpx-part` holds at least `bytes` (the tail beyond it is truncated on resume). Otherwise the partial is discarded and the copy restarts from zero, with `CopyReason::New`. This prevents concatenating two different files that happened to share a name.
 
 MTP uploads are not resumable in place. `MtpEndpoint::partial` always returns `None`.
 
@@ -386,7 +406,7 @@ pub(crate) trait Endpoint: Send + Sync {
     async fn scan(&self, filter: &Filter, cancel: &CancelToken, progress: &dyn Fn(u64)) -> Result<Snapshot>;
     async fn stat(&self, path: &RelPath) -> Result<Option<Entry>>;
     async fn read(&self, path: &RelPath, offset: u64) -> Result<ByteStream>;
-    async fn write(&self, req: WriteRequest, input: ByteStream) -> Result<WriteOutcome>;
+    async fn write(&self, req: WriteRequest, input: ByteStream) -> Result<()>;
     async fn partial(&self, path: &RelPath) -> Result<Option<PartialInfo>>;
     async fn mkdir(&self, path: &RelPath) -> Result<()>;
     async fn remove(&self, path: &RelPath, kind: EntryKind) -> Result<()>;
@@ -396,7 +416,7 @@ pub(crate) trait Endpoint: Send + Sync {
 pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 ```
 
-`LocalEndpoint`: `std::fs` inside `spawn_blocking`, `BufWriter` 1 MiB, writes to `.mtpx-part`, sidecar written before the first byte and updated on `abort`, `finish` verifies length, sets mtime with `filetime`, `fsync`, renames.
+`LocalEndpoint`: `tokio::fs`, writes to `.mtpx-part`, sidecar checkpointed every 64 MiB and rewritten on `abort`, `finish` verifies length, stamps the mtime best-effort, `fsync`, renames.
 
 `MtpEndpoint`: wraps one `Storage` and a root `RemotePath`. `read` uses `download_windowed(handle, ByteRange::From(offset), 4 MiB)` and yields each window as chunks. `write` uses `upload_with_progress`; on `UploadError { partial: Some(h) }` it deletes `h` before returning the error. `scan` uses `collect_objects_recursive` reporting objects found so far.
 
@@ -427,7 +447,7 @@ pub(crate) enum RetryClass { Safe, Resolve, Reconcile, Never }
 | mkdir | Reconcile | re-list parent; if the folder now exists, success |
 | remove | Reconcile | re-list parent; if the object is now absent, success |
 | upload | Reconcile | delete partial handle if reported, re-stat dest; if a same-size object exists, treat as done, else retry once |
-| anything on `Disconnected`, `DeviceReset`, `NoDevice`, `PermissionDenied`, `ExclusiveAccess` | Never | abort the batch: emit `Finished` with the partial report, return `Err` |
+| anything on `Disconnected`, `DeviceReset`, `NoDevice`, `PermissionDenied`, `ExclusiveAccess`, or a full or read-only local disk | Never | abort the batch: emit `Aborted` with the partial report (the file in flight among `failed`) and the remaining count, return `Err` |
 | anything on `Cancelled` | Never | interrupt the batch: emit `Interrupted` and `Finished`, return `Ok(report)` with `interrupted` set |
 | `AccessDenied` (per object: read-only storage, write-protected object) | Never | fail the file, continue |
 
@@ -444,7 +464,7 @@ Persisting ───────> Reporting: emit Interrupted { remaining_files 
 Reporting ────────> Closed: close the session cleanly, return Ok(report) with report.interrupted
 ```
 
-A second Ctrl-C during `Draining` exits the process immediately; the sidecar may then be behind the `.mtpx-part`, which the next run detects (`bytes` mismatch) and restarts that file.
+A second Ctrl-C during `Draining` exits the process immediately; the sidecar may then be behind the `.mtpx-part`, and the next run resumes from the last checkpoint (at most 64 MiB behind), truncating the unrecorded tail. Neither the data nor the sidecar is fsynced at a checkpoint, so the guarantee covers process death, not power loss.
 
 Uploads mid-flight on cancel: `upload_with_progress` returns `ControlFlow::Break`, the partial remote object is deleted, the file is reported failed with "interrupted".
 
@@ -468,10 +488,12 @@ pub enum Error {
     NoDevice,
     AmbiguousDevice(Vec<DeviceSummary>),
     StorageRequired(Vec<StorageSummary>),
-    StorageNotFound(String),
+    DeviceNotFound { selector: String, available: Vec<DeviceSummary> },
+    StorageNotFound { wanted: String, available: Vec<StorageSummary> },
     ExclusiveAccess { holder: Option<ExclusiveHolder> },
     PermissionDenied,
     RemotePathNotFound(DevicePath),
+    RemotePathUndescribed { path: DevicePath, skipped: usize },
     NotADirectory(DevicePath),
     InvalidPath(#[from] PathError),
     Conflicts(Vec<RelPath>),
@@ -490,7 +512,7 @@ The core never prints, never exits, never reads env vars or config files.
 ### 6.15 Feature flags
 
 - `virtual-device`: re-exports `mtp-rs`'s virtual device and adds `Device::open_virtual(dir)`. Used by tests and by the CLI's hidden `--virtual <dir>` flag in debug builds.
-- `tracing`: forwards `mtp-rs` tracing.
+- `mtp-rs`'s `tracing` feature is always on, so `-v` reaches the transport layer; there is no separate feature on this crate.
 
 ## 7. CLI (`mtpx`)
 
@@ -539,7 +561,7 @@ Done in 2m 12s: 182 copied (4.3 GB, 33.1 MB/s avg), 1,102 skipped, 0 failed
 - Two `indicatif` bars: current file, overall (bytes, percent, 3 second moving-average speed, ETA, file count).
 - Non-TTY: one line per file event, no bars, no colors.
 - `--quiet`: errors and the final summary line.
-- `NO_COLOR` and `--no-color` respected. ASCII fallback for non-UTF-8 locales.
+- `NO_COLOR`, `--no-color`, `CLICOLOR_FORCE` and `TERM=dumb` respected through console's stderr detection; a dumb terminal gets lines and no prompts. ASCII fallback for non-UTF-8 locales.
 
 `--json` is a separate, versioned contract:
 
@@ -586,7 +608,7 @@ Every line carries `"version": 1`. Field names are documented in `docs/cli.md`. 
 | 0 | success (sync with nothing to do is success) |
 | 1 | generic error |
 | 2 | usage error |
-| 3 | no device, ambiguous device, or a device that does not answer |
+| 3 | no device, ambiguous device, a device that does not answer, or one that disconnected |
 | 4 | device access denied (exclusive access, permissions) |
 | 5 | remote path or storage not found, storage required |
 | 6 | one or more transfers failed (summary printed) |
@@ -664,14 +686,14 @@ Every test uses `mtp-rs`'s virtual device over a `tempdir`. Runs on all three pl
 
 ### 9.4 Hardware
 
-`docs/manual-checklist.md` for the Moto g52: `doctor`, `ls`, pull one file, sync `/DCIM/Camera`, Ctrl-C mid-transfer, resume, `--move` a throwaway folder, unplug mid-transfer. Milestone 1 is not done until this passes.
+`docs/manual-checklist.md` for the Moto g52: `doctor`, `ls`, pull one file, sync `/DCIM/Camera`, Ctrl-C mid-transfer, resume, `--move` a throwaway folder, unplug mid-transfer. Milestone 1 is not done until this passes. Each run's results are filed under `docs/hardware-runs/`.
 
 ## 10. Code standards
 
 The goal is code a senior engineer reads once and understands. Concretely:
 
 - Rust 2024, MSRV 1.85, `rust-toolchain.toml`.
-- Workspace lints: `clippy::pedantic` and `clippy::nursery` warn, `unsafe_code = "forbid"`, `missing_docs` deny in core, `unwrap_used` and `expect_used` deny outside tests.
+- Workspace lints: `clippy::pedantic` and `clippy::nursery` warn, `unsafe_code = "forbid"`, `missing_docs` warn (an error under CI's `-D warnings`), `unwrap_used` and `expect_used` deny outside tests.
 - Functions under 20 lines. A function that needs a comment to explain its flow is two functions.
 - One concept per module. Modules over 300 lines get split.
 - Named constants for every number: `DOWNLOAD_WINDOW`, `PUMP_DEPTH`, `MTIME_TOLERANCE`, `PROGRESS_INTERVAL`.
@@ -686,7 +708,7 @@ The goal is code a senior engineer reads once and understands. Concretely:
 
 ## 11. Dependencies
 
-Core: `mtp-rs`, `tokio` (rt-multi-thread, sync, fs, macros), `futures`, `bytes`, `thiserror`, `globset`, `filetime`, `serde` + `serde_json` (sidecar only), `tracing`.
+Core: `mtp-rs`, `tokio` (rt-multi-thread, sync, fs, macros), `futures`, `bytes`, `thiserror`, `globset`, `serde` + `serde_json` (sidecar only), `tracing`.
 
 CLI: `clap` (derive, env, wrap_help), `clap_complete`, `clap_mangen`, `indicatif`, `console`, `dialoguer`, `miette` (fancy), `serde_json`, `toml`, `directories`, `humansize`, `humantime`, `tracing-subscriber`, `tokio::signal`.
 
@@ -739,6 +761,7 @@ Milestone 1 is a vertical slice that validates the dangerous assumptions on real
 - Core `1.0` is decoupled from the TUI.
 - Name: `mtpx` (CLI), `mtpx-core` (library). Both free on crates.io as of 2026-09-16.
 - A cancelled run is an outcome, not an error. `run` returns `Ok(Report { interrupted: true })`; `Report.interrupted` exists for exactly this and the CLI maps it to exit 130. Only a lost device or session (`Disconnected`, `DeviceReset`, `NoDevice`, `PermissionDenied`, `ExclusiveAccess`) returns `Err`.
-- A stale handle rebuilds the whole resolver cache, not just the parent's subtree. Android re-keys every object on a media rescan, so nothing cached survives it; a subtree invalidation leaves stale grandparents in place.
+- A stale handle first re-lists only its parent and retries; the whole resolver cache is rebuilt only when the parent itself turns out stale. A single deletion on the phone is `StaleHandle` too, and it must not cost a full second scan; a media rescan re-keys every object, and a stale parent is how that shows.
 - Retries in M1 cover opening a read, and the backoff sleeps in 100 ms slices so a cancel is noticed promptly. A transient error mid-file fails that file; the sidecar lets the next run resume it. Window-level retry inside the MTP pump is M2.
 - Known risk from `mtp-rs` docs: some Android devices (Pixel) wedge after a cancelled read without reporting `DeviceReset`; the next operation hangs. M2 adds an operation timeout; M1 relies on windowed downloads, whose wedge is the recoverable one.
+- `missing_docs` was first planned as `deny` in core, then briefly allowed on the grounds that names carry the meaning. It is back to `warn` at the workspace (an error in CI): a public item without a one-line contract is a review finding, and a doc that restates the name is one too.
