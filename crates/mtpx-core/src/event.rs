@@ -1,51 +1,83 @@
 //! Progress events emitted while planning and transferring, plus the final report.
 
 use crate::{
+    entry::SkippedEntry,
     path::RelPath,
     plan::{PlanSummary, SkipReason},
 };
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Which end of a transfer an event refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
-    /// Where files are read from.
+    /// The side files are read from: the device on a pull.
     Source,
-    /// Where files are written to.
+    /// The side files are written to: the local directory on a pull.
     Dest,
 }
 
-/// Advice attached to a ready plan that the CLI may surface before starting.
+/// Advice attached to a ready plan that a caller may surface before starting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Hint {
     /// The USB link is slower than the volume of data warrants.
     SlowLink {
-        /// Bytes the plan will move.
+        /// Bytes the plan will move over that link.
         bytes: u64,
     },
-    /// The device refused to describe some objects; they are missing from the plan.
+    /// The device refused to describe some objects; they are missing from the plan. Each
+    /// entry names the folder whose listing was incomplete and what the device answered.
     DeviceSkippedObjects {
-        /// How many objects were skipped.
-        count: usize,
+        /// One entry per incomplete folder, in scan order.
+        skipped: Vec<SkippedEntry>,
+    },
+    /// Partial downloads on the destination that no planned copy will resume: their source is
+    /// gone or already complete. Nothing removes them; `bytes` is what they occupy.
+    StalePartials {
+        /// Part files left behind, each with or without its sidecar.
+        count: u64,
+        /// Disk space those part files occupy.
+        bytes: u64,
     },
 }
 
-/// Totals for a finished or interrupted transfer.
+/// A file that failed after retries, with the error message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FailedFile {
+    /// Relative to the transfer root on both sides.
+    pub path: RelPath,
+    /// The final error's message; retried errors before it are not kept.
+    pub error: String,
+}
+
+impl FailedFile {
+    /// Records that `path` failed with `error`, the message as it will be shown.
+    #[must_use]
+    pub fn new(path: RelPath, error: impl Into<String>) -> Self {
+        Self {
+            path,
+            error: error.into(),
+        }
+    }
+}
+
+/// Totals for a finished, interrupted or aborted transfer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Report {
-    /// Files fully copied and verified.
+    /// Files that reached their final name in this run.
     pub copied: u64,
-    /// Bytes streamed from the source this run.
+    /// Excludes any resumed prefix; only this run's bytes.
     pub bytes: u64,
-    /// Files left untouched.
+    /// Files the plan or a conflict policy left untouched.
     pub skipped: u64,
-    /// Files that failed after retries, with the error message.
-    pub failed: Vec<(RelPath, String)>,
+    /// Includes the file in flight when the run aborted.
+    pub failed: Vec<FailedFile>,
     /// Wall-clock time from the first action to the last.
     pub elapsed: Duration,
-    /// Whether the transfer was cancelled before the plan completed.
+    /// Set when cancellation stopped the run before its last action.
     pub interrupted: bool,
 }
 
@@ -53,83 +85,98 @@ pub struct Report {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProgressEvent {
-    /// A recursive listing of one side began.
+    /// A side is about to be walked; both sides are scanned concurrently.
     ScanStarted {
-        /// Which side is being listed.
+        /// Which walk began.
         side: Side,
     },
-    /// The listing found more objects.
+    /// Best-effort: dropped when the channel is full.
     ScanProgress {
-        /// Which side is being listed.
+        /// Which walk advanced.
         side: Side,
-        /// Objects found so far.
+        /// Entries seen so far on that side, files and directories together.
         found: u64,
     },
-    /// The listing completed.
+    /// A side's walk is complete; the plan needs both.
     ScanFinished {
-        /// Which side was listed.
+        /// Which walk ended.
         side: Side,
-        /// Objects described.
+        /// Entries that made it into the snapshot.
         entries: u64,
-        /// Objects the side refused to describe.
+        /// Entries the walk could not describe and left out.
         skipped: u64,
     },
-    /// Both sides are scanned and the plan is decided.
+    /// Both scans are in and nothing has moved yet; a dry run stops here.
     PlanReady {
-        /// Totals for the plan.
+        /// Counts and byte totals of what the plan will do.
         summary: PlanSummary,
-        /// Advice worth showing before the transfer starts.
+        /// Advice worth surfacing before the first byte moves.
         hints: Vec<Hint>,
     },
-    /// A file copy began.
+    /// A copy is about to stream; `FileFinished` or `FileFailed` follows for the same path.
     FileStarted {
-        /// File being copied.
+        /// Relative to the transfer root on both sides.
         path: RelPath,
-        /// Full size of the file.
+        /// The size the source reported when the plan was built.
         size: u64,
-        /// Offset the copy resumes from; zero for a fresh copy.
+        /// Zero for a fresh copy.
         resume_from: u64,
     },
-    /// More bytes of the current file landed on the destination.
+    /// Best-effort: dropped when the channel is full.
     FileProgress {
-        /// File being copied.
+        /// The file in flight.
         path: RelPath,
-        /// Bytes streamed from the source so far, including any resumed prefix.
+        /// Includes any resumed prefix.
         bytes: u64,
     },
-    /// A file copy completed and was length-verified.
+    /// The file reached its final name.
     FileFinished {
-        /// File that was copied.
+        /// The file that landed.
         path: RelPath,
-        /// Bytes written during this run.
+        /// Only this run's bytes, unlike `FileProgress`.
         bytes: u64,
-        /// Time spent on this file.
+        /// Time spent streaming this run's bytes; retry backoff before the stream opened is excluded.
         elapsed: Duration,
     },
-    /// A file copy failed.
+    /// A copy attempt failed; with `will_retry` the same path starts again after a backoff.
     FileFailed {
-        /// File that failed.
+        /// The file that failed.
         path: RelPath,
-        /// Error message.
+        /// The attempt's error message.
         error: String,
-        /// Whether the executor will try again.
+        /// Whether another attempt follows; false means the file counts as failed.
         will_retry: bool,
     },
-    /// A file was deliberately left alone.
+    /// A planned skip was reached; nothing was read or written for it.
     Skipped {
-        /// File that was skipped.
+        /// The path left untouched.
         path: RelPath,
-        /// Why.
+        /// Why the plan left it alone.
         reason: SkipReason,
     },
-    /// Cancellation was requested; the current file is being persisted.
+    /// Cancellation was honoured. Any file in flight has already kept its partial (or dropped
+    /// it when it was a stale tail), and the `remaining_files` copies were not attempted.
+    /// Always followed by `Finished` with `report.interrupted` set.
     Interrupted {
-        /// Files the plan still had left.
+        /// Planned copies that never started.
         remaining_files: u64,
     },
-    /// The operation is over.
+    /// The run returned `Ok`; `report` equals the one it returns. Always the last event.
     Finished {
-        /// Final totals.
+        /// The same totals the run returns.
         report: Report,
     },
+    /// The run is returning `Err` because no further endpoint call could succeed; `report`
+    /// holds the totals reached so far and is not otherwise returned. Always the last event.
+    Aborted {
+        /// Totals up to the failure, including the file in flight under `failed`.
+        report: Report,
+        /// Copies not completed, counting the one that was in flight.
+        remaining_files: u64,
+    },
+}
+
+/// Progress has no observer in the plain library path, so a closed receiver is not an error.
+pub(crate) async fn emit(events: &mpsc::Sender<ProgressEvent>, event: ProgressEvent) {
+    let _ = events.send(event).await;
 }

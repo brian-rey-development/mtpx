@@ -1,6 +1,6 @@
 [package]
 name = "mtpx-core"
-version = "0.1.0"
+version.workspace = true
 description = "Incremental MTP transfer engine: plan, transfer, sync and resume files on Android devices"
 keywords = ["mtp", "android", "sync", "usb", "transfer"]
 categories = ["filesystem", "hardware-support"]
@@ -9,24 +9,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 
 [features]
 virtual-device = ["mtp-rs/virtual-device"]
 bench-internals = []
 
+[package.metadata.docs.rs]
+features = ["virtual-device"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mtp-rs = { workspace = true }
-tokio = { workspace = true, features = ["sync", "fs", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "fs", "io-util", "time"] }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-filetime = { workspace = true }
 jiff = { workspace = true }
 walkdir = { workspace = true }
+same-file = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -41,3 +45,11 @@ workspace = true
 name = "planner"
 harness = false
 required-features = ["bench-internals"]
+
+[[test]]
+name = "pull"
+required-features = ["virtual-device"]
+
+[[test]]
+name = "sync"
+required-features = ["virtual-device"]

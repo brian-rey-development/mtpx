@@ -5,6 +5,9 @@ pub mod diagnostic;
 pub mod format;
 pub mod progress;
 pub mod prompt;
+pub mod stderr;
 pub mod stdout;
 pub mod table;
+#[cfg(test)]
+pub mod test_util;
 pub mod theme;

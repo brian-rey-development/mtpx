@@ -2,32 +2,30 @@
 
 use crate::{
     cli::LsArgs,
-    commands::{self, Ctx, Outcome, Output},
-    ui::{format, table},
+    commands::{self, Ctx, Outcome},
+    ui::{format, stderr, table},
 };
-use mtpx_core::{DevicePath, Result, Snapshot};
+use mtpx_core::Result;
 
-/// Lists `path` and prints it; objects the device refused to describe are counted on stderr
-/// unless quiet.
+/// Lists `path` and prints it. Objects the device refused to describe are missing from the
+/// listing, so they are counted on stderr even when quiet.
 pub async fn run(ctx: &Ctx, args: &LsArgs) -> Result<Outcome> {
-    let snapshot = list(ctx, &ctx.resolve(&args.path), args.recursive).await?;
+    let path = ctx.resolve(&args.path);
+    let snapshot = ctx
+        .with_storage(&path, async |p| {
+            ctx.device.ls(p, args.recursive, &ctx.cancel).await
+        })
+        .await?;
     commands::print(&table::ls(&snapshot, args.long))?;
-    let skipped = snapshot.skipped().len() as u64;
-    if skipped > 0 && ctx.ui.output != Output::Quiet {
-        eprintln!(
+    let skipped = snapshot.skipped();
+    if !skipped.is_empty() {
+        stderr::line(&format!(
             "{} the device refused to describe were left out",
-            format::objects(skipped)
-        );
+            format::objects(skipped.len() as u64)
+        ));
+        for line in format::skipped_lines(skipped) {
+            stderr::line(&line);
+        }
     }
     Ok(Outcome::Done)
-}
-
-async fn list(ctx: &Ctx, path: &DevicePath, recursive: bool) -> Result<Snapshot> {
-    match ctx.device.ls(path, recursive, &ctx.cancel).await {
-        Err(error) => {
-            let picked = ctx.pick_storage(path, error)?;
-            ctx.device.ls(&picked, recursive, &ctx.cancel).await
-        }
-        listed => listed,
-    }
 }

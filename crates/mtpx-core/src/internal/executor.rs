@@ -4,34 +4,28 @@
 use crate::{
     entry::ModifiedTime,
     error::{Error, Result},
-    event::{ProgressEvent, Report},
+    event::{self, FailedFile, ProgressEvent, Report},
     internal::endpoint::{ByteStream, Endpoint, WriteRequest},
     path::RelPath,
     plan::{Action, Plan, SkipReason},
 };
 use futures::StreamExt;
 use mtp_rs::CancelToken;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{io, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
 
 /// How many times a read that failed with a transient MTP error is attempted again.
-pub const MAX_READ_RETRIES: u32 = 3;
+pub(crate) const MAX_READ_RETRIES: u32 = 3;
 /// Pause before the first retry; it doubles on every further attempt.
-pub const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// Longest stretch a backoff sleeps before looking at the cancel token again.
-pub const CANCEL_POLL: Duration = Duration::from_millis(100);
+pub(crate) const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Runs a plan against two endpoints, reporting through `events`.
 ///
 /// Every event except `FileProgress` is awaited, so the receiver must be drained while the
 /// run is in flight; `FileProgress` is best-effort and dropped when the channel is full.
-pub struct Executor {
+pub(crate) struct Executor {
     cancel: CancelToken,
     events: mpsc::Sender<ProgressEvent>,
 }
@@ -45,8 +39,7 @@ enum Stop {
 type StepResult = std::result::Result<(), Stop>;
 
 impl Executor {
-    /// Binds a cancellation token and an event channel for the runs that follow.
-    pub const fn new(cancel: CancelToken, events: mpsc::Sender<ProgressEvent>) -> Self {
+    pub(crate) const fn new(cancel: CancelToken, events: mpsc::Sender<ProgressEvent>) -> Self {
         Self { cancel, events }
     }
 
@@ -54,9 +47,11 @@ impl Executor {
     ///
     /// # Errors
     /// Only the errors that end the whole batch: the device disconnected, vanished, was reset,
-    /// or refused access. A cancelled run is `Ok` with `report.interrupted` set; a failed file
+    /// or refused access, or the destination is full or read-only. Such a run ends with
+    /// `Aborted` instead of `Finished`, carrying the totals so far with the file in flight
+    /// among the failed. A cancelled run is `Ok` with `report.interrupted` set; a failed file
     /// lands in `report.failed` and the run continues.
-    pub async fn run<S: Endpoint, D: Endpoint>(
+    pub(crate) async fn run<S: Endpoint, D: Endpoint>(
         &self,
         plan: &Plan,
         source: &S,
@@ -66,17 +61,17 @@ impl Executor {
         let mut report = Report::default();
         let actions = plan.actions();
         for (index, action) in actions.iter().enumerate() {
-            match self.step(action, source, dest, &mut report).await {
-                Ok(()) => {}
-                Err(Stop::Interrupted) => {
-                    let remaining = remaining_copies(&actions[index..]);
-                    return Ok(self.interrupt(report, since, remaining).await);
+            let Err(stop) = self.step(action, source, dest, &mut report).await else {
+                continue;
+            };
+            let remaining = remaining_copies(&actions[index..]);
+            return match stop {
+                Stop::Interrupted => Ok(self.interrupt(report, since, remaining).await),
+                Stop::Aborted(error) => {
+                    self.abort(report, since, remaining).await;
+                    Err(error)
                 }
-                Err(Stop::Aborted(error)) => {
-                    self.finish(report, since).await;
-                    return Err(error);
-                }
-            }
+            };
         }
         Ok(self.finish(report, since).await)
     }
@@ -137,12 +132,10 @@ impl Executor {
         report: &mut Report,
     ) -> StepResult {
         let path = request.path.clone();
-        self.emit(ProgressEvent::FileStarted {
-            path: path.clone(),
-            size: request.expected_size,
-            resume_from: request.resume_from,
-        })
-        .await;
+        let request = match self.settle(dest, request).await {
+            Ok(request) => request,
+            Err(error) => return self.fail(report, &path, error).await,
+        };
         match self.copy_one(source, dest, request).await {
             Ok(bytes) => {
                 report.copied += 1;
@@ -153,21 +146,40 @@ impl Executor {
         }
     }
 
-    /// Streams one file and returns the bytes that flowed this run, excluding any resumed prefix.
+    /// Announces `FileStarted` with the offset the copy will actually stream from.
+    async fn settle<D: Endpoint>(&self, dest: &D, request: WriteRequest) -> Result<WriteRequest> {
+        let resume_from = dest
+            .resume_offset(&request.path, request.resume_from)
+            .await?;
+        self.emit(ProgressEvent::FileStarted {
+            path: request.path.clone(),
+            size: request.expected_size,
+            resume_from,
+        })
+        .await;
+        Ok(WriteRequest {
+            resume_from,
+            ..request
+        })
+    }
+
+    /// Returns the bytes that flowed this run: the destination's `Ok` commits exactly
+    /// `expected_size`, so the difference from the resume offset is what moved.
     async fn copy_one<S: Endpoint, D: Endpoint>(
         &self,
         source: &S,
         dest: &D,
         request: WriteRequest,
     ) -> Result<u64> {
-        let since = Instant::now();
+        let resume_from = request.resume_from;
         let raw = self
-            .read_with_retry(source, &request.path, request.resume_from)
+            .read_with_retry(source, &request.path, resume_from)
             .await?;
+        let since = Instant::now();
         let path = request.path.clone();
-        let (stream, streamed) = self.progress_stream(raw, path.clone(), request.resume_from);
+        let bytes = request.expected_size - resume_from;
+        let stream = self.progress_stream(raw, path.clone(), resume_from);
         dest.write(request, stream).await?;
-        let bytes = streamed.load(Ordering::Relaxed);
         let elapsed = since.elapsed();
         self.emit(ProgressEvent::FileFinished {
             path,
@@ -179,7 +191,7 @@ impl Executor {
     }
 
     /// Opens the source stream, retrying transient MTP errors with a doubling backoff. Errors
-    /// after the stream has started are not retried in M1: the file is reported failed and the
+    /// after the stream has started are not retried: the file is reported failed and the
     /// destination's partial lets the next run resume it.
     async fn read_with_retry<S: Endpoint>(
         &self,
@@ -200,12 +212,17 @@ impl Executor {
         source.read(path, offset, &self.cancel).await
     }
 
+    /// A cancel that landed with the error is honoured before a retry is announced, so the
+    /// observer never sees a retry that cannot happen.
     async fn report_and_back_off(
         &self,
         path: &RelPath,
         error: &mtp_rs::Error,
         backoff: Duration,
     ) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         self.emit(ProgressEvent::FileFailed {
             path: path.clone(),
             error: error.to_string(),
@@ -227,44 +244,39 @@ impl Executor {
         Ok(())
     }
 
-    /// Counts every chunk that passes and reports it. `try_send` keeps a slow observer from
-    /// stalling the pump: a full channel drops the progress event, and the next one catches up.
-    fn progress_stream(
-        &self,
-        stream: ByteStream,
-        path: RelPath,
-        resume_from: u64,
-    ) -> (ByteStream, Arc<AtomicU64>) {
-        let streamed = Arc::new(AtomicU64::new(0));
-        let counter = Arc::clone(&streamed);
+    /// Reports every chunk that passes. `try_send` keeps a slow observer from stalling the
+    /// pump: a full channel drops the progress event, and the next one catches up.
+    fn progress_stream(&self, stream: ByteStream, path: RelPath, resume_from: u64) -> ByteStream {
         let events = self.events.clone();
+        let mut so_far = resume_from;
         let reported = stream.inspect(move |item| {
             let Ok(chunk) = item else { return };
-            let len = chunk.len() as u64;
-            let so_far = counter.fetch_add(len, Ordering::Relaxed) + len;
+            so_far += chunk.len() as u64;
             let _ = events.try_send(ProgressEvent::FileProgress {
                 path: path.clone(),
-                bytes: resume_from + so_far,
+                bytes: so_far,
             });
         });
-        (Box::pin(reported), streamed)
+        Box::pin(reported)
     }
 
     async fn fail(&self, report: &mut Report, path: &RelPath, error: Error) -> StepResult {
         if matches!(error, Error::Cancelled) {
             return Err(Stop::Interrupted);
         }
+        let message = error.to_string();
+        report
+            .failed
+            .push(FailedFile::new(path.clone(), message.clone()));
         if aborts_batch(&error) {
             return Err(Stop::Aborted(error));
         }
-        let message = error.to_string();
         self.emit(ProgressEvent::FileFailed {
             path: path.clone(),
-            error: message.clone(),
+            error: message,
             will_retry: false,
         })
         .await;
-        report.failed.push((path.clone(), message));
         Ok(())
     }
 
@@ -273,6 +285,15 @@ impl Executor {
             .await;
         report.interrupted = true;
         self.finish(report, since).await
+    }
+
+    async fn abort(&self, mut report: Report, since: Instant, remaining_files: u64) {
+        report.elapsed = since.elapsed();
+        self.emit(ProgressEvent::Aborted {
+            report,
+            remaining_files,
+        })
+        .await;
     }
 
     async fn finish(&self, mut report: Report, since: Instant) -> Report {
@@ -284,9 +305,8 @@ impl Executor {
         report
     }
 
-    /// A transfer without an observer still completes, so a closed receiver is not an error.
     async fn emit(&self, event: ProgressEvent) {
-        let _ = self.events.send(event).await;
+        event::emit(&self.events, event).await;
     }
 }
 
@@ -304,15 +324,24 @@ fn request(
     }
 }
 
-/// The errors after which no further endpoint call can succeed.
-const fn aborts_batch(error: &Error) -> bool {
-    matches!(
-        error,
+/// The errors after which no further endpoint call can succeed: the device is gone or refuses
+/// us, or the destination cannot take another byte.
+fn aborts_batch(error: &Error) -> bool {
+    match error {
         Error::Disconnected
-            | Error::NoDevice
-            | Error::PermissionDenied
-            | Error::ExclusiveAccess { .. }
-            | Error::Mtp(mtp_rs::Error::DeviceReset)
+        | Error::NoDevice
+        | Error::PermissionDenied
+        | Error::ExclusiveAccess { .. }
+        | Error::Mtp(mtp_rs::Error::DeviceReset) => true,
+        Error::Io(e) | Error::LocalIo { source: e, .. } => destination_is_unwritable(e),
+        _ => false,
+    }
+}
+
+fn destination_is_unwritable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::ReadOnlyFilesystem
     )
 }
 
@@ -332,15 +361,11 @@ mod tests {
     )]
 
     use super::*;
-    use crate::{
-        internal::endpoint::{ScanResult, WriteOutcome},
-        plan::CopyReason,
-    };
+    use crate::{internal::endpoint::ScanResult, plan::CopyReason, test_support::rel};
     use bytes::Bytes;
     use futures::StreamExt;
     use std::{
         collections::HashMap,
-        io,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -357,10 +382,13 @@ mod tests {
         read_offsets: Mutex<Vec<u64>>,
         read_failures: AtomicUsize,
         failure: fn() -> Error,
-        cancel_after_chunks: Option<usize>,
+        /// Set the token from inside a failing read, as a Ctrl-C landing with the error would.
+        cancel_on_failure: Option<CancelToken>,
+        fail_after_chunks: Option<(usize, fn() -> Error)>,
         cancel_after_write: Option<CancelToken>,
         write_failure: Option<fn() -> Error>,
         mkdir_fails: bool,
+        resume_probe: Option<u64>,
     }
 
     impl Default for FakeEndpoint {
@@ -371,10 +399,12 @@ mod tests {
                 read_offsets: Mutex::default(),
                 read_failures: AtomicUsize::new(0),
                 failure: || Error::Disconnected,
-                cancel_after_chunks: None,
+                cancel_on_failure: None,
+                fail_after_chunks: None,
                 cancel_after_write: None,
                 write_failure: None,
                 mkdir_fails: false,
+                resume_probe: None,
             }
         }
     }
@@ -393,8 +423,11 @@ mod tests {
         }
 
         fn failing_reads(self, count: usize, failure: fn() -> Error) -> Self {
-            self.read_failures.store(count, Ordering::SeqCst);
-            Self { failure, ..self }
+            Self {
+                read_failures: AtomicUsize::new(count),
+                failure,
+                ..self
+            }
         }
 
         fn file(&self, path: &str) -> Option<Vec<u8>> {
@@ -402,12 +435,11 @@ mod tests {
         }
 
         fn take_read_failure(&self) -> bool {
-            let remaining = self.read_failures.load(Ordering::SeqCst);
-            if remaining == 0 {
-                return false;
-            }
-            self.read_failures.store(remaining - 1, Ordering::SeqCst);
-            true
+            self.read_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
         }
 
         fn chunks_from(&self, data: &[u8], offset: u64) -> Vec<Result<Bytes>> {
@@ -416,9 +448,9 @@ mod tests {
                 .chunks(TEST_CHUNK)
                 .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
                 .collect();
-            if let Some(after) = self.cancel_after_chunks {
+            if let Some((after, failure)) = self.fail_after_chunks {
                 items.truncate(after);
-                items.push(Err(Error::Cancelled));
+                items.push(Err(failure()));
             }
             items
         }
@@ -444,7 +476,13 @@ mod tests {
             Ok(ScanResult {
                 snapshot: crate::entry::Snapshot::new("fake", Vec::new(), Vec::new()),
                 partials: HashMap::new(),
+                folding: crate::planner::NameFolding::Exact,
             })
+        }
+
+        async fn resume_offset(&self, path: &RelPath, requested: u64) -> Result<u64> {
+            let _ = path;
+            Ok(self.resume_probe.unwrap_or(requested))
         }
 
         async fn read(
@@ -455,6 +493,9 @@ mod tests {
         ) -> Result<ByteStream> {
             self.read_offsets.lock().unwrap().push(offset);
             if self.take_read_failure() {
+                if let Some(cancel) = &self.cancel_on_failure {
+                    cancel.cancel();
+                }
                 return Err((self.failure)());
             }
             let data = self
@@ -465,11 +506,7 @@ mod tests {
             )))
         }
 
-        async fn write(
-            &self,
-            request: WriteRequest,
-            mut input: ByteStream,
-        ) -> Result<WriteOutcome> {
+        async fn write(&self, request: WriteRequest, mut input: ByteStream) -> Result<()> {
             if let Some(failure) = self.write_failure {
                 return Err(failure());
             }
@@ -492,7 +529,7 @@ mod tests {
             if let Some(cancel) = &self.cancel_after_write {
                 cancel.cancel();
             }
-            Ok(WriteOutcome { bytes: actual })
+            Ok(())
         }
 
         async fn mkdir(&self, path: &RelPath) -> Result<()> {
@@ -502,10 +539,6 @@ mod tests {
             self.dirs.lock().unwrap().push(path.clone());
             Ok(())
         }
-    }
-
-    fn rel(path: &str) -> RelPath {
-        RelPath::new(path.split('/')).unwrap()
     }
 
     fn mkdir(path: &str) -> Action {
@@ -572,6 +605,9 @@ mod tests {
                 format!("interrupted {remaining_files}")
             }
             ProgressEvent::Finished { .. } => "done".to_owned(),
+            ProgressEvent::Aborted {
+                remaining_files, ..
+            } => format!("aborted {remaining_files}"),
             other => format!("{other:?}"),
         }
     }
@@ -598,9 +634,27 @@ mod tests {
 
     fn final_report(events: &[ProgressEvent]) -> &Report {
         match events.last() {
-            Some(ProgressEvent::Finished { report }) => report,
-            other => panic!("last event is not Finished: {other:?}"),
+            Some(ProgressEvent::Finished { report } | ProgressEvent::Aborted { report, .. }) => {
+                report
+            }
+            other => panic!("last event is not terminal: {other:?}"),
         }
+    }
+
+    fn finished_elapsed(events: &[ProgressEvent], file: &str) -> Duration {
+        events
+            .iter()
+            .find_map(|e| match e {
+                ProgressEvent::FileFinished { path, elapsed, .. } if path.to_string() == file => {
+                    Some(*elapsed)
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn failed_paths(report: &Report) -> Vec<String> {
+        report.failed.iter().map(|f| f.path.to_string()).collect()
     }
 
     #[tokio::test]
@@ -683,6 +737,10 @@ mod tests {
                 "done",
             ]
         );
+        assert!(
+            finished_elapsed(&events, "a") < RETRY_BACKOFF,
+            "the backoff is not billed to the file"
+        );
         let report = outcome.unwrap();
         assert_eq!(report.copied, 1);
         assert!(report.failed.is_empty());
@@ -713,12 +771,12 @@ mod tests {
         let report = outcome.unwrap();
         assert_eq!(report.copied, 1);
         assert_eq!(report.failed.len(), 1);
-        assert_eq!(report.failed[0].0, rel("a"));
+        assert_eq!(report.failed[0].path, rel("a"));
         assert!(dest.file("a").is_none());
         assert_eq!(dest.file("b").unwrap(), b"bb");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_non_retryable_read_error_fails_the_file_at_once() {
         let source = FakeEndpoint::with_files(&[("a", TEN_BYTES)])
             .failing_reads(1, || Error::Mtp(mtp_rs::Error::StaleHandle));
@@ -727,7 +785,7 @@ mod tests {
         let before = tokio::time::Instant::now();
         let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
 
-        assert!(before.elapsed() < RETRY_BACKOFF);
+        assert_eq!(before.elapsed(), Duration::ZERO);
         assert_eq!(
             without_progress(&events),
             ["started a 10 from 0", "failed a retry=false", "done"]
@@ -759,7 +817,7 @@ mod tests {
         assert_eq!(report.copied, 1);
         assert_eq!(report.bytes, 2);
         assert_eq!(report.failed.len(), 1);
-        assert!(report.failed[0].1.contains("length mismatch"));
+        assert!(report.failed[0].error.contains("length mismatch"));
         assert_eq!(dest.file("b").unwrap(), b"bb");
     }
 
@@ -778,7 +836,11 @@ mod tests {
         });
         let (outcome, events) = run_plan(&plan, &source, &dest, &cancel).await;
 
-        assert!(before.elapsed() < RETRY_BACKOFF, "{:?}", before.elapsed());
+        assert!(
+            before.elapsed() <= CANCEL_POLL * 2,
+            "{:?}",
+            before.elapsed()
+        );
         assert_eq!(
             without_progress(&events),
             [
@@ -791,6 +853,29 @@ mod tests {
         let report = outcome.unwrap();
         assert!(report.interrupted);
         assert_eq!(report.copied, 0);
+        assert!(report.failed.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_error_that_lands_with_a_cancel_is_an_interruption_not_a_retry() {
+        let cancel = CancelToken::new();
+        let source = FakeEndpoint {
+            cancel_on_failure: Some(cancel.clone()),
+            ..FakeEndpoint::with_files(&[("a", TEN_BYTES)])
+                .failing_reads(1, || Error::Mtp(mtp_rs::Error::Timeout))
+        };
+        let dest = FakeEndpoint::default();
+        let plan = plan_of(&[copy("a", 10, 0)]);
+        let before = tokio::time::Instant::now();
+        let (outcome, events) = run_plan(&plan, &source, &dest, &cancel).await;
+
+        assert_eq!(before.elapsed(), Duration::ZERO);
+        assert_eq!(
+            without_progress(&events),
+            ["started a 10 from 0", "interrupted 1", "done"]
+        );
+        let report = outcome.unwrap();
+        assert!(report.interrupted);
         assert!(report.failed.is_empty());
     }
 
@@ -841,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_cancelled_mid_file_keeps_the_partial_and_counts_that_file_as_remaining() {
         let source = FakeEndpoint {
-            cancel_after_chunks: Some(1),
+            fail_after_chunks: Some((1, || Error::Cancelled)),
             ..FakeEndpoint::with_files(&[("a", TEN_BYTES)])
         };
         let dest = FakeEndpoint::default();
@@ -860,7 +945,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_disconnect_ends_the_batch_with_a_partial_report() {
+    async fn a_stream_error_mid_file_fails_that_file_without_retry_and_keeps_the_partial() {
+        let source = FakeEndpoint {
+            fail_after_chunks: Some((1, || Error::Mtp(mtp_rs::Error::Timeout))),
+            ..FakeEndpoint::with_files(&[("a", TEN_BYTES)])
+        };
+        let dest = FakeEndpoint::default();
+        let plan = plan_of(&[copy("a", 10, 0)]);
+        let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
+
+        assert_eq!(
+            without_progress(&events),
+            ["started a 10 from 0", "failed a retry=false", "done"]
+        );
+        assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
+        assert_eq!(dest.file("a").unwrap(), &TEN_BYTES[..TEST_CHUNK]);
+        let report = outcome.unwrap();
+        assert_eq!(report.copied, 0);
+        assert_eq!(failed_paths(&report), ["a"]);
+        assert!(!report.interrupted);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_mid_stream_aborts_the_batch_and_keeps_the_partial() {
+        let source = FakeEndpoint {
+            fail_after_chunks: Some((1, || Error::Disconnected)),
+            ..FakeEndpoint::with_files(&[("a", TEN_BYTES), ("b", b"bb")])
+        };
+        let dest = FakeEndpoint::default();
+        let plan = plan_of(&[copy("a", 10, 0), copy("b", 2, 0)]);
+        let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
+
+        assert!(matches!(outcome, Err(Error::Disconnected)), "{outcome:?}");
+        assert_eq!(
+            without_progress(&events),
+            ["started a 10 from 0", "aborted 2"]
+        );
+        assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
+        assert_eq!(dest.file("a").unwrap(), &TEN_BYTES[..TEST_CHUNK]);
+        assert!(dest.file("b").is_none());
+        let report = final_report(&events);
+        assert_eq!(report.copied, 0);
+        assert_eq!(failed_paths(report), ["a"]);
+        assert!(!report.interrupted);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_on_open_aborts_the_batch_with_the_totals_so_far() {
         let source = FakeEndpoint::with_files(&[("a", b"aa"), ("b", b"bb"), ("c", b"cc")])
             .failing_reads(1, || Error::Disconnected);
         let dest = FakeEndpoint::default();
@@ -868,15 +999,20 @@ mod tests {
         let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
 
         assert!(matches!(outcome, Err(Error::Disconnected)), "{outcome:?}");
-        assert_eq!(without_progress(&events), ["started a 2 from 0", "done"]);
+        assert_eq!(
+            without_progress(&events),
+            ["started a 2 from 0", "aborted 3"]
+        );
         let report = final_report(&events);
         assert_eq!(report.copied, 0);
+        assert_eq!(failed_paths(report), ["a"]);
+        assert!(report.failed[0].error.contains("disconnected"));
         assert!(!report.interrupted);
         assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
     }
 
     #[tokio::test]
-    async fn a_disconnect_while_writing_ends_the_batch_after_finished() {
+    async fn a_disconnect_while_writing_aborts_without_touching_the_next_file() {
         let source = FakeEndpoint::with_files(&[("a", b"aa"), ("b", b"bb")]);
         let dest = FakeEndpoint {
             write_failure: Some(|| Error::Disconnected),
@@ -886,12 +1022,100 @@ mod tests {
         let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
 
         assert!(matches!(outcome, Err(Error::Disconnected)), "{outcome:?}");
-        assert_eq!(without_progress(&events), ["started a 2 from 0", "done"]);
+        assert_eq!(
+            without_progress(&events),
+            ["started a 2 from 0", "aborted 2"]
+        );
         let report = final_report(&events);
         assert_eq!(report.copied, 0);
-        assert!(report.failed.is_empty());
+        assert_eq!(failed_paths(report), ["a"]);
         assert!(!report.interrupted);
         assert!(dest.file("b").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_destination_aborts_the_batch_without_touching_the_next_file() {
+        let source = FakeEndpoint::with_files(&[("a", b"aa"), ("b", b"bb")]);
+        let dest = FakeEndpoint {
+            write_failure: Some(|| Error::Io(io::Error::from(io::ErrorKind::StorageFull))),
+            ..FakeEndpoint::default()
+        };
+        let plan = plan_of(&[copy("a", 2, 0), copy("b", 2, 0)]);
+        let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(e)) if e.kind() == io::ErrorKind::StorageFull),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            without_progress(&events),
+            ["started a 2 from 0", "aborted 2"]
+        );
+        assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
+        assert!(dest.file("b").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_error_while_writing_is_recorded_without_retry() {
+        let source = FakeEndpoint::with_files(&[("a", b"aa"), ("b", b"bb")]);
+        let dest = FakeEndpoint {
+            write_failure: Some(|| Error::Mtp(mtp_rs::Error::Timeout)),
+            ..FakeEndpoint::default()
+        };
+        let plan = plan_of(&[copy("a", 2, 0), copy("b", 2, 0)]);
+        let before = tokio::time::Instant::now();
+        let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
+
+        assert_eq!(before.elapsed(), Duration::ZERO);
+        assert_eq!(
+            without_progress(&events),
+            [
+                "started a 2 from 0",
+                "failed a retry=false",
+                "started b 2 from 0",
+                "failed b retry=false",
+                "done",
+            ]
+        );
+        let report = outcome.unwrap();
+        assert_eq!(report.copied, 0);
+        assert_eq!(failed_paths(&report), ["a", "b"]);
+        assert!(!report.interrupted);
+    }
+
+    #[test]
+    fn only_device_level_and_unwritable_destination_errors_abort_the_batch() {
+        let local_io = |kind: io::ErrorKind| Error::LocalIo {
+            op: "write",
+            path: "/x".into(),
+            source: io::Error::from(kind),
+        };
+        let aborting = [
+            Error::Disconnected,
+            Error::NoDevice,
+            Error::PermissionDenied,
+            Error::ExclusiveAccess { holder: None },
+            Error::Mtp(mtp_rs::Error::DeviceReset),
+            Error::Io(io::Error::from(io::ErrorKind::StorageFull)),
+            Error::Io(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)),
+            local_io(io::ErrorKind::StorageFull),
+            local_io(io::ErrorKind::ReadOnlyFilesystem),
+        ];
+        for error in &aborting {
+            assert!(aborts_batch(error), "{error:?}");
+        }
+        let recorded = [
+            Error::Cancelled,
+            Error::Mtp(mtp_rs::Error::Timeout),
+            Error::Mtp(mtp_rs::Error::StaleHandle),
+            Error::SourceVanished(rel("a")),
+            Error::Io(io::Error::other("disk")),
+            Error::Io(io::Error::from(io::ErrorKind::NotFound)),
+            local_io(io::ErrorKind::IsADirectory),
+        ];
+        for error in &recorded {
+            assert!(!aborts_batch(error), "{error:?}");
+        }
     }
 
     #[tokio::test]
@@ -915,7 +1139,7 @@ mod tests {
         );
         let report = outcome.unwrap();
         assert_eq!(report.failed.len(), 1);
-        assert_eq!(report.failed[0].0, rel("d"));
+        assert_eq!(report.failed[0].path, rel("d"));
         assert_eq!(report.copied, 1);
     }
 
@@ -981,5 +1205,43 @@ mod tests {
         let report = outcome.unwrap();
         assert_eq!(report.bytes, 6);
         assert_eq!(report.copied, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_planned_offset_is_probed_and_streams_from_zero() {
+        let source = FakeEndpoint::with_files(&[("f.bin", b"abcdef")]);
+        let dest = FakeEndpoint {
+            resume_probe: Some(0),
+            ..FakeEndpoint::default()
+        };
+        let plan = plan_of(&[copy("f.bin", 6, 4)]);
+        let (outcome, events) = run_plan(&plan, &source, &dest, &CancelToken::new()).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
+        assert_eq!(dest.file("f.bin").unwrap(), b"abcdef");
+        assert_eq!(
+            without_progress(&events),
+            ["started f.bin 6 from 0", "finished f.bin 6", "done"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_plan_against_a_real_destination_lands_the_whole_file() {
+        use crate::{internal::local::LocalEndpoint, test_support::identity};
+        let source = FakeEndpoint::with_files(&[("f.bin", b"abcdef")]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.bin.mtpx-part"), b"xx").unwrap();
+        let dest = LocalEndpoint::new(dir.path(), identity("ZY22", "Internal"));
+        let (tx, rx) = mpsc::channel(EVENT_CAPACITY);
+        let report = Executor::new(CancelToken::new(), tx)
+            .run(&plan_of(&[copy("f.bin", 6, 4)]), &source, &dest)
+            .await
+            .unwrap();
+        drop(rx);
+        assert_eq!(*source.read_offsets.lock().unwrap(), vec![0]);
+        assert_eq!(report.copied, 1);
+        assert_eq!(report.bytes, 6);
+        assert_eq!(std::fs::read(dir.path().join("f.bin")).unwrap(), b"abcdef");
+        assert!(!dir.path().join("f.bin.mtpx-part").exists());
     }
 }

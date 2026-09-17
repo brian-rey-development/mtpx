@@ -1,4 +1,4 @@
-//! Storage selectors and the `storage:/path` form every CLI remote argument parses into.
+//! Storage selectors and the `storage:/path` form a remote argument parses into.
 
 use crate::path::{PathError, RemotePath, SEPARATOR};
 use std::{fmt, str::FromStr};
@@ -8,7 +8,7 @@ const STORAGE_DELIMITER: char = ':';
 /// Which storage on the device. Separate from the path: "Internal" is not a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageSelector {
-    /// The only storage, or the configured default; an error when the device has several.
+    /// The only storage; an error when the device exposes none or several.
     Default,
     /// Storage by its position in the device's enumeration order.
     Index(usize),
@@ -17,7 +17,7 @@ pub enum StorageSelector {
     Named(String),
 }
 
-/// A storage plus a path. What every CLI remote argument parses into.
+/// A storage plus an absolute path inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevicePath {
     /// Which storage the path lives on.
@@ -26,11 +26,13 @@ pub struct DevicePath {
     pub path: RemotePath,
 }
 
-fn parse_selector(prefix: &str) -> StorageSelector {
-    prefix.parse::<usize>().map_or_else(
-        |_| StorageSelector::Named(prefix.to_owned()),
-        StorageSelector::Index,
-    )
+impl From<&str> for StorageSelector {
+    /// Digits select by index; anything else is a name.
+    fn from(value: &str) -> Self {
+        value
+            .parse()
+            .map_or_else(|_| Self::Named(value.to_owned()), Self::Index)
+    }
 }
 
 fn is_storage_prefix(prefix: &str) -> bool {
@@ -40,7 +42,7 @@ fn is_storage_prefix(prefix: &str) -> bool {
 fn split_storage(input: &str) -> (StorageSelector, &str) {
     match input.split_once(STORAGE_DELIMITER) {
         Some((prefix, rest)) if is_storage_prefix(prefix) && rest.starts_with(SEPARATOR) => {
-            (parse_selector(prefix), rest)
+            (StorageSelector::from(prefix), rest)
         }
         _ => (StorageSelector::Default, input),
     }
@@ -115,6 +117,30 @@ mod tests {
         }
     }
 
+    /// Only the first colon before any slash can delimit a storage; Windows hosts refuse a
+    /// colon inside a name outright, so this parse rule is only observable elsewhere.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_colon_after_the_first_slash_belongs_to_the_path() {
+        let cases = [
+            (
+                "/DCIM/12:30.png",
+                StorageSelector::Default,
+                vec!["DCIM", "12:30.png"],
+            ),
+            (
+                "sd:/a/b:c",
+                StorageSelector::Named("sd".into()),
+                vec!["a", "b:c"],
+            ),
+        ];
+        for (input, storage, segments) in cases {
+            let parsed: DevicePath = input.parse().unwrap();
+            assert_eq!(parsed.storage, storage, "{input}");
+            assert_eq!(parsed.path.segments(), segments, "{input}");
+        }
+    }
+
     #[test]
     fn rejects_invalid_device_paths() {
         let cases = [
@@ -124,6 +150,8 @@ mod tests {
             ("/a/../b", PathError::DotSegment),
             ("Internal:DCIM", PathError::NotAbsolute),
             ("/a\0b", PathError::InvalidSegment("a\0b".into())),
+            ("a:b:/c", PathError::NotAbsolute),
+            ("Internal:", PathError::NotAbsolute),
         ];
         for (input, expected) in cases {
             let err = input.parse::<DevicePath>().unwrap_err();

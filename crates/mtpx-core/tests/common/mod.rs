@@ -20,8 +20,6 @@ const CAPACITY: u64 = 1024 * 1024 * 1024;
 /// Deep enough that a burst of `FileProgress` never stalls the executor on the collector.
 const EVENTS_CAPACITY: usize = 1024;
 
-/// An open virtual device, the directory backing its only storage, and a local directory to
-/// pull into.
 pub struct VirtualPhone {
     pub device: Device,
     pub serial: String,
@@ -29,8 +27,6 @@ pub struct VirtualPhone {
     local: TempDir,
 }
 
-/// What a full `pull` produced: the plan it ran, the report it ended with, and every event
-/// in between.
 pub struct Pulled {
     pub plan: Plan,
     pub report: Report,
@@ -42,7 +38,6 @@ impl VirtualPhone {
         Self::open_with(test_name, |_| {}).await
     }
 
-    /// Opens a phone whose config was adjusted by `configure` before the device came up.
     pub async fn open_with(
         test_name: &str,
         configure: impl FnOnce(&mut VirtualDeviceConfig),
@@ -63,17 +58,14 @@ impl VirtualPhone {
         }
     }
 
-    /// The directory the phone's storage reads from.
     pub fn backing(&self) -> &Path {
         self.backing.path()
     }
 
-    /// The directory pulls land in.
     pub fn local(&self) -> &Path {
         self.local.path()
     }
 
-    /// Writes `files` under the backing directory, creating parents as needed.
     pub fn seed(&self, files: &[(&str, &[u8])]) {
         for (path, content) in files {
             let full = self.backing.path().join(path);
@@ -82,7 +74,6 @@ impl VirtualPhone {
         }
     }
 
-    /// Plans and runs a pull of `remote` into the local directory, collecting every event.
     pub async fn pull(&self, remote: &str, opts: &TransferOptions) -> Pulled {
         let (tx, rx) = events();
         let collector = collect(rx);
@@ -96,7 +87,6 @@ impl VirtualPhone {
         }
     }
 
-    /// Plans a pull of `remote` into the local directory without running it.
     pub async fn plan(
         &self,
         remote: &str,
@@ -109,8 +99,7 @@ impl VirtualPhone {
             .await
     }
 
-    /// Every file under the local directory, keyed by its `/`-joined relative path. Partials
-    /// and sidecars are listed too, so their absence can be asserted.
+    /// Partials and sidecars are listed too, so their absence can be asserted.
     pub fn local_tree(&self) -> BTreeMap<String, Vec<u8>> {
         let mut tree = BTreeMap::new();
         read_tree(self.local(), self.local(), &mut tree);
@@ -164,7 +153,6 @@ pub fn collect(mut rx: Receiver<ProgressEvent>) -> JoinHandle<Vec<ProgressEvent>
     })
 }
 
-/// Runs `job`, then closes the channel and waits for everything the collector saw.
 pub async fn run_collecting(
     job: PullJob<'_>,
     events: Sender<ProgressEvent>,

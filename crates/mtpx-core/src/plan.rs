@@ -2,7 +2,7 @@
 
 use crate::{entry::ModifiedTime, path::RelPath};
 
-/// Why a file is going to be copied.
+/// Why the planner decided a file must move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CopyReason {
@@ -12,28 +12,34 @@ pub enum CopyReason {
     SizeDiffers,
 }
 
-/// Why a file is left alone.
+/// Why the planner leaves a path untouched; the executor reports it without reading either side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SkipReason {
-    /// Both sides already agree.
+    /// Same kind and size on both sides.
     Identical,
-    /// The sides differ and the conflict policy says not to touch it.
+    /// The sizes differ and the policy leaves the destination alone.
     Conflict,
+    /// A file on one side is a directory on the other, or sits beneath such a directory;
+    /// nothing is deleted to make room for a different kind.
+    KindConflict,
+    /// The destination folds names, and another source entry already claims this one under
+    /// folding; the first in source order wins.
+    NameCollision,
 }
 
-/// One step of a transfer.
+/// One step of a plan. Parents come before children, so an executor can run the list in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
-    /// Create a directory on the destination.
+    /// Create a directory that the source has and the destination lacks.
     Mkdir {
-        /// Directory to create.
+        /// Relative to the transfer root on both sides.
         path: RelPath,
     },
-    /// Copy a file from source to destination.
+    /// Stream a file from source to destination, replacing whatever the destination holds.
     Copy {
-        /// File to copy.
+        /// Relative to the transfer root on both sides.
         path: RelPath,
         /// Full size of the source file.
         size: u64,
@@ -41,29 +47,30 @@ pub enum Action {
         modified: Option<ModifiedTime>,
         /// Offset a matching partial already holds; zero for a fresh copy.
         resume_from: u64,
-        /// Why the planner decided to copy.
+        /// What made the copy necessary, for reporting.
         reason: CopyReason,
     },
-    /// Leave a file untouched.
+    /// Leave the path alone on both sides.
     Skip {
-        /// File being skipped.
+        /// Relative to the transfer root on both sides.
         path: RelPath,
-        /// Why it is skipped.
+        /// What ruled the path out, for reporting.
         reason: SkipReason,
     },
 }
 
-/// Totals derived from a plan's actions.
+/// Totals of a plan. Sizes come from the device, so every sum saturates rather than wraps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlanSummary {
-    /// Number of `Copy` actions.
+    /// Copy actions, whether fresh or resumed.
     pub files_to_copy: u64,
-    /// Bytes that still need to move, after subtracting resumable partials.
+    /// After subtracting resumable partials.
     pub bytes_to_copy: u64,
     /// Bytes already present in partials that will not be re-read.
     pub resumable_bytes: u64,
-    /// Number of `Skip` actions.
-    pub to_skip: u64,
+    /// Skip actions of every reason; directories are never counted.
+    pub files_to_skip: u64,
 }
 
 impl PlanSummary {
@@ -73,11 +80,13 @@ impl PlanSummary {
                 size, resume_from, ..
             } => {
                 debug_assert!(resume_from <= size, "resume_from must not exceed size");
-                self.files_to_copy += 1;
-                self.bytes_to_copy += size.saturating_sub(*resume_from);
-                self.resumable_bytes += resume_from;
+                self.files_to_copy = self.files_to_copy.saturating_add(1);
+                self.bytes_to_copy = self
+                    .bytes_to_copy
+                    .saturating_add(size.saturating_sub(*resume_from));
+                self.resumable_bytes = self.resumable_bytes.saturating_add(*resume_from);
             }
-            Action::Skip { .. } => self.to_skip += 1,
+            Action::Skip { .. } => self.files_to_skip = self.files_to_skip.saturating_add(1),
             Action::Mkdir { .. } => {}
         }
         self
@@ -92,7 +101,6 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Wraps the actions in execution order and derives their totals.
     pub(crate) fn new(actions: Vec<Action>) -> Self {
         let summary = actions
             .iter()
@@ -100,25 +108,25 @@ impl Plan {
         Self { actions, summary }
     }
 
-    /// The actions in execution order.
+    /// The steps in execution order: every `Mkdir` precedes the actions beneath it.
     #[must_use]
     pub fn actions(&self) -> &[Action] {
         &self.actions
     }
 
-    /// The totals for the whole plan.
+    /// Totals computed once when the plan was built; they never diverge from `actions()`.
     #[must_use]
     pub const fn summary(&self) -> PlanSummary {
         self.summary
     }
 
-    /// Number of actions, including skips and directory creations.
+    /// Number of actions, directories and skips included.
     #[must_use]
     pub fn len(&self) -> usize {
         self.actions.len()
     }
 
-    /// Whether the plan has no actions at all; use `summary().files_to_copy` for "nothing to copy".
+    /// An empty plan has no actions at all; use `summary().files_to_copy` for "nothing to copy".
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
@@ -130,10 +138,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    fn rel(name: &str) -> RelPath {
-        RelPath::new([name]).unwrap()
-    }
+    use crate::test_support::rel;
 
     fn skip(name: &str, reason: SkipReason) -> Action {
         Action::Skip {
@@ -167,7 +172,7 @@ mod tests {
                 files_to_copy: 2,
                 bytes_to_copy: 400,
                 resumable_bytes: 200,
-                to_skip: 2,
+                files_to_skip: 2,
             }
         );
         assert_eq!(plan.len(), 5);
@@ -186,7 +191,7 @@ mod tests {
         assert_eq!(
             plan.summary(),
             PlanSummary {
-                to_skip: 1,
+                files_to_skip: 1,
                 ..PlanSummary::default()
             }
         );
@@ -198,6 +203,13 @@ mod tests {
         assert!(plan.is_empty());
         assert_eq!(plan.len(), 0);
         assert_eq!(plan.summary(), PlanSummary::default());
+    }
+
+    #[test]
+    fn summary_saturates_on_absurd_device_sizes() {
+        let plan = Plan::new(vec![copy("a", u64::MAX, 0), copy("b", u64::MAX, 0)]);
+        assert_eq!(plan.summary().bytes_to_copy, u64::MAX);
+        assert_eq!(plan.summary().files_to_copy, 2);
     }
 
     #[cfg(debug_assertions)]

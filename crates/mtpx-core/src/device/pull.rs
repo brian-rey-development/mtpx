@@ -5,7 +5,7 @@ use crate::{
     device_path::DevicePath,
     entry::Snapshot,
     error::Result,
-    event::{Hint, ProgressEvent, Report, Side},
+    event::{Hint, ProgressEvent, Report, Side, emit},
     internal::{
         endpoint::{Endpoint, ScanResult},
         executor::Executor,
@@ -13,11 +13,12 @@ use crate::{
         mtp::MtpEndpoint,
     },
     options::TransferOptions,
-    plan::Plan,
-    planner,
+    path::RelPath,
+    plan::{Action, Plan},
+    planner::{self, Partials},
 };
 use mtp_rs::{CancelToken, UsbSpeed};
-use std::{fmt, marker::PhantomData, path::Path, sync::Arc};
+use std::{collections::HashSet, fmt, marker::PhantomData, path::Path, sync::Arc};
 use tokio::sync::mpsc;
 
 /// Plans that move more than this over a USB 2.0 or slower link get a `SlowLink` hint.
@@ -42,8 +43,8 @@ impl Device {
         cancel: &CancelToken,
         events: &mpsc::Sender<ProgressEvent>,
     ) -> Result<PullJob<'d>> {
-        let source = self.endpoint(remote).await?;
-        let dest = LocalEndpoint::new(local, source.identity().clone());
+        let source = self.endpoint(remote, cancel).await?;
+        let dest = destination(local, &source);
         let (scanned_source, scanned_dest) = tokio::try_join!(
             scan_side(&source, Side::Source, cancel, events),
             scan_side(&dest, Side::Dest, cancel, events),
@@ -51,13 +52,25 @@ impl Device {
         let plan = planner::plan(
             &scanned_source.snapshot,
             &scanned_dest.snapshot,
+            scanned_dest.folding,
             &scanned_dest.partials,
             opts,
         )?;
-        let hints = hints(self.summary().speed, &plan, &scanned_source.snapshot);
+        self.announce(&plan, &scanned_source, &scanned_dest, events)
+            .await;
+        Ok(PullJob::bind(plan, source, dest))
+    }
+
+    async fn announce(
+        &self,
+        plan: &Plan,
+        source: &ScanResult,
+        dest: &ScanResult,
+        events: &mpsc::Sender<ProgressEvent>,
+    ) {
+        let hints = hints(self.summary().speed, plan, &source.snapshot, &dest.partials);
         let summary = plan.summary();
         emit(events, ProgressEvent::PlanReady { summary, hints }).await;
-        Ok(PullJob::bind(plan, source, dest))
     }
 }
 
@@ -86,12 +99,14 @@ impl PullJob<'_> {
         &self.plan
     }
 
-    /// Copies every planned file, reporting per-file events and a final `Finished` through `events`.
+    /// Copies every planned file, reporting per-file events and a terminal `Finished`, or
+    /// `Aborted` when this returns `Err`, through `events`.
     ///
     /// # Errors
     /// Only the errors that end the whole batch: `Disconnected`, `NoDevice`, `PermissionDenied`,
-    /// `ExclusiveAccess`, or a device reset. A cancelled run is `Ok` with `report.interrupted`
-    /// set, and a file that fails after retries lands in `report.failed`.
+    /// `ExclusiveAccess`, a device reset, or a full or read-only local disk. A cancelled run is
+    /// `Ok` with `report.interrupted` set, and a file that fails after retries lands in
+    /// `report.failed`.
     pub async fn run(
         self,
         cancel: &CancelToken,
@@ -113,8 +128,16 @@ impl fmt::Debug for PullJob<'_> {
     }
 }
 
-/// Scans one side, bracketing it with `ScanStarted` and `ScanFinished` and reporting the running
-/// count in between. Progress uses `try_send` so a slow observer never stalls the walk.
+/// A single-file pull only ever touches that file, so its destination scans nothing else.
+fn destination(local: &Path, source: &MtpEndpoint) -> LocalEndpoint {
+    let peer = source.identity().clone();
+    source.file_name().map_or_else(
+        || LocalEndpoint::new(local, peer.clone()),
+        |name| LocalEndpoint::for_file(local, name, peer.clone()),
+    )
+}
+
+/// Progress uses `try_send` so a slow observer never stalls the walk.
 async fn scan_side<E: Endpoint>(
     endpoint: &E,
     side: Side,
@@ -138,26 +161,51 @@ async fn scan_side<E: Endpoint>(
     Ok(scanned)
 }
 
-fn hints(speed: Option<UsbSpeed>, plan: &Plan, source: &Snapshot) -> Vec<Hint> {
+fn hints(
+    speed: Option<UsbSpeed>,
+    plan: &Plan,
+    source: &Snapshot,
+    partials: &Partials,
+) -> Vec<Hint> {
     let mut hints = Vec::new();
     let bytes = plan.summary().bytes_to_copy;
     if is_slow(speed) && bytes > SLOW_LINK_BYTES {
         hints.push(Hint::SlowLink { bytes });
     }
-    let count = source.skipped().len();
+    if !source.skipped().is_empty() {
+        hints.push(Hint::DeviceSkippedObjects {
+            skipped: source.skipped().to_vec(),
+        });
+    }
+    let (count, bytes) = stale_partials(plan, partials);
     if count > 0 {
-        hints.push(Hint::DeviceSkippedObjects { count });
+        hints.push(Hint::StalePartials { count, bytes });
     }
     hints
 }
 
-const fn is_slow(speed: Option<UsbSpeed>) -> bool {
-    matches!(speed, Some(UsbSpeed::Low | UsbSpeed::Full | UsbSpeed::High))
+/// Partials that no copy in `plan` will resume: their file is skipped as identical or is not
+/// in the plan at all. Only vetted partials reach here, so the count never includes another
+/// device's leftovers.
+fn stale_partials(plan: &Plan, partials: &Partials) -> (u64, u64) {
+    let resumed: HashSet<&RelPath> = plan
+        .actions()
+        .iter()
+        .filter_map(|action| match action {
+            Action::Copy { path, .. } => Some(path),
+            Action::Mkdir { .. } | Action::Skip { .. } => None,
+        })
+        .collect();
+    partials
+        .iter()
+        .filter(|(path, _)| !resumed.contains(path))
+        .fold((0, 0), |(count, bytes), (_, partial)| {
+            (count + 1, bytes.saturating_add(partial.bytes))
+        })
 }
 
-/// A plan without an observer still completes, so a closed receiver is not an error.
-async fn emit(events: &mpsc::Sender<ProgressEvent>, event: ProgressEvent) {
-    let _ = events.send(event).await;
+const fn is_slow(speed: Option<UsbSpeed>) -> bool {
+    matches!(speed, Some(UsbSpeed::Low | UsbSpeed::Full | UsbSpeed::High))
 }
 
 #[cfg(test)]
@@ -168,14 +216,17 @@ mod hint_tests {
     use crate::{
         entry::{SkippedEntry, Snapshot},
         event::Hint,
+        internal::partial::{Fingerprint, PartialInfo},
         path::RelPath,
-        plan::{Action, CopyReason, Plan},
+        plan::{Action, CopyReason, Plan, SkipReason},
+        planner::Partials,
+        test_support::rel,
     };
     use mtp_rs::UsbSpeed;
 
     fn plan_moving(bytes: u64) -> Plan {
         Plan::new(vec![Action::Copy {
-            path: RelPath::new(["big.bin"]).unwrap(),
+            path: rel("big.bin"),
             size: bytes,
             modified: None,
             resume_from: 0,
@@ -183,34 +234,84 @@ mod hint_tests {
         }])
     }
 
+    fn partial(path: &str, bytes: u64) -> (RelPath, PartialInfo) {
+        let fingerprint = Fingerprint {
+            size: bytes,
+            modified: None,
+        };
+        (rel(path), PartialInfo { fingerprint, bytes })
+    }
+
     #[test]
     fn slow_link_needs_a_usb2_or_slower_link_and_more_than_the_threshold() {
         let empty = Snapshot::new("/", vec![], vec![]);
+        let none = Partials::new();
         let big = plan_moving(SLOW_LINK_BYTES + 1);
         for speed in [UsbSpeed::Low, UsbSpeed::Full, UsbSpeed::High] {
             let expected = vec![Hint::SlowLink {
                 bytes: SLOW_LINK_BYTES + 1,
             }];
-            assert_eq!(hints(Some(speed), &big, &empty), expected, "{speed:?}");
+            assert_eq!(
+                hints(Some(speed), &big, &empty, &none),
+                expected,
+                "{speed:?}"
+            );
         }
         for speed in [Some(UsbSpeed::Super), Some(UsbSpeed::SuperPlus), None] {
-            assert!(hints(speed, &big, &empty).is_empty(), "{speed:?}");
+            assert!(hints(speed, &big, &empty, &none).is_empty(), "{speed:?}");
         }
         let at_threshold = plan_moving(SLOW_LINK_BYTES);
-        assert!(hints(Some(UsbSpeed::High), &at_threshold, &empty).is_empty());
+        assert!(hints(Some(UsbSpeed::High), &at_threshold, &empty, &none).is_empty());
     }
 
     #[test]
-    fn skipped_objects_on_the_source_are_reported_with_their_count() {
-        let refused = SkippedEntry {
-            parent: RelPath::root(),
-            reason: "refused".into(),
-        };
-        let source = Snapshot::new("/", vec![], vec![refused.clone(), refused]);
+    fn skipped_objects_on_the_source_are_reported_with_where_and_why() {
+        let refused = SkippedEntry::new(RelPath::root(), "refused");
+        let source = Snapshot::new("/", vec![], vec![refused.clone(), refused.clone()]);
         assert_eq!(
-            hints(None, &plan_moving(1), &source),
-            vec![Hint::DeviceSkippedObjects { count: 2 }]
+            hints(None, &plan_moving(1), &source, &Partials::new()),
+            vec![Hint::DeviceSkippedObjects {
+                skipped: vec![refused.clone(), refused]
+            }]
         );
+    }
+
+    fn plan_resuming_one_and_skipping_one() -> Plan {
+        Plan::new(vec![
+            Action::Copy {
+                path: rel("resumed.bin"),
+                size: 100,
+                modified: None,
+                resume_from: 40,
+                reason: CopyReason::New,
+            },
+            Action::Skip {
+                path: rel("same.bin"),
+                reason: SkipReason::Identical,
+            },
+        ])
+    }
+
+    #[test]
+    fn partials_no_copy_resumes_are_reported_as_stale_with_their_size() {
+        let empty = Snapshot::new("/", vec![], vec![]);
+        let plan = plan_resuming_one_and_skipping_one();
+        let partials: Partials = [
+            partial("resumed.bin", 40),
+            partial("same.bin", 30),
+            partial("gone.bin", 12),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            hints(None, &plan, &empty, &partials),
+            vec![Hint::StalePartials {
+                count: 2,
+                bytes: 42
+            }]
+        );
+        let live: Partials = std::iter::once(partial("resumed.bin", 40)).collect();
+        assert!(hints(None, &plan, &empty, &live).is_empty());
     }
 }
 
@@ -225,10 +326,7 @@ mod tests {
         event::{ProgressEvent, Side},
         internal::{
             endpoint::Identity,
-            mtp::{
-                DOWNLOAD_WINDOW, PUMP_DEPTH,
-                test_support::{pseudo_random, rel, seed_tree},
-            },
+            mtp::test_support::{CANCEL_FILE, pseudo_random, rel, seed_tree},
             partial::{Fingerprint, Sidecar, part_path, write_sidecar},
         },
         options::TransferOptions,
@@ -240,9 +338,6 @@ mod tests {
 
     const CAMERA: &str = "/DCIM/Camera";
     const CAMERA_FILE: &str = "/DCIM/Camera/a.jpg";
-    /// More windows than the pump can hold buffered plus in flight once the token is set,
-    /// so the run cannot finish before the cancel is observed.
-    const RESUME_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
 
     async fn plan_remote<'d>(
         fixture: &'d Fixture,
@@ -381,7 +476,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.plan().summary().files_to_copy, 0);
-        assert_eq!(second.plan().summary().to_skip, 2);
+        assert_eq!(second.plan().summary().files_to_skip, 2);
         assert!(second.plan().actions().iter().all(|action| matches!(
             action,
             Action::Skip {
@@ -544,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn an_interrupted_pull_leaves_a_partial_that_the_next_pull_resumes() {
         let fixture = open_device("resume").await;
-        let content = pseudo_random(RESUME_FILE);
+        let content = pseudo_random(CANCEL_FILE);
         fs::create_dir_all(fixture.root().join("DCIM/Camera")).unwrap();
         fs::write(fixture.root().join("DCIM/Camera/big.bin"), &content).unwrap();
         let local = tempfile::tempdir().unwrap();
@@ -553,8 +648,6 @@ mod tests {
         let cancel = CancelToken::new();
         let (tx, rx) = events();
         let (forwarded_tx, mut forwarded_rx) = events();
-        // Drains events concurrently because the executor blocks on a full channel, and cancels
-        // on the first progress event so the interruption always lands mid-file.
         let forwarder = tokio::spawn(forward_and_cancel_on_progress(
             rx,
             forwarded_tx,
@@ -570,7 +663,7 @@ mod tests {
         assert_eq!(report.copied, 0);
         assert!(part.exists() && sidecar.exists());
         let part_len = fs::metadata(&part).unwrap().len();
-        assert!(part_len > 0 && part_len < RESUME_FILE as u64, "{part_len}");
+        assert!(part_len > 0 && part_len < CANCEL_FILE as u64, "{part_len}");
         let seen = drain(&mut forwarded_rx);
         assert!(seen.contains(&ProgressEvent::Interrupted { remaining_files: 1 }));
 
@@ -583,7 +676,7 @@ mod tests {
             job.plan().actions(),
             [copy(
                 "big.bin",
-                RESUME_FILE as u64,
+                CANCEL_FILE as u64,
                 part_len,
                 CopyReason::New
             )]
@@ -591,7 +684,7 @@ mod tests {
         let report = job.run(&CancelToken::new(), &tx).await.unwrap();
         assert!(!report.interrupted);
         assert_eq!(report.copied, 1);
-        assert_eq!(report.bytes, RESUME_FILE as u64 - part_len);
+        assert_eq!(report.bytes, CANCEL_FILE as u64 - part_len);
         assert_eq!(fs::read(local.path().join("big.bin")).unwrap(), content);
         assert!(!part.exists() && !sidecar.exists());
     }

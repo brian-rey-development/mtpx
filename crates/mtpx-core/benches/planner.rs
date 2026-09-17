@@ -2,7 +2,7 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use mtpx_core::{
-    __bench::{Partials, plan},
+    __bench::{NameFolding, Partials, plan},
     Entry, EntryKind, PathError, RelPath, Snapshot, TransferOptions,
 };
 use std::hint::black_box;
@@ -12,21 +12,13 @@ const FILES_PER_DIR: u32 = 100;
 const FILE_SIZE: u64 = 4 * 1024 * 1024;
 
 fn dir(index: u32) -> Result<Entry, PathError> {
-    Ok(Entry {
-        path: RelPath::new([format!("d{index:04}")])?,
-        kind: EntryKind::Dir,
-        size: 0,
-        modified: None,
-    })
+    let path = RelPath::new([format!("d{index:04}")])?;
+    Ok(Entry::new(path, EntryKind::Dir, 0, None))
 }
 
 fn file(dir_index: u32, file_index: u32) -> Result<Entry, PathError> {
-    Ok(Entry {
-        path: RelPath::new([format!("d{dir_index:04}"), format!("f{file_index:03}.bin")])?,
-        kind: EntryKind::File,
-        size: FILE_SIZE,
-        modified: None,
-    })
+    let path = RelPath::new([format!("d{dir_index:04}"), format!("f{file_index:03}.bin")])?;
+    Ok(Entry::new(path, EntryKind::File, FILE_SIZE, None))
 }
 
 fn tree(keep_file: impl Fn(u32) -> bool) -> Result<Snapshot, PathError> {
@@ -54,6 +46,7 @@ fn plan_100k_files(c: &mut Criterion) {
             plan(
                 black_box(&source),
                 black_box(&dest),
+                NameFolding::Exact,
                 black_box(&partials),
                 black_box(&opts),
             )
@@ -61,8 +54,7 @@ fn plan_100k_files(c: &mut Criterion) {
     });
 }
 
-// Criterion's macros emit undocumented items and offer no hook to document them.
-#[allow(missing_docs)]
+#[allow(missing_docs, reason = "criterion's macros emit undocumented items")]
 mod harness {
     use super::{criterion_group, plan_100k_files};
     criterion_group!(benches, plan_100k_files);

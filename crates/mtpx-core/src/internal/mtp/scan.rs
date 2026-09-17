@@ -1,14 +1,17 @@
 //! Lists device folders one at a time, naming each child under its parent, and walks a subtree with them.
 
 use crate::{
+    display::sanitize_for_display,
     entry::{Entry, EntryKind, ModifiedTime, SkippedEntry},
     error::{Error, Result},
+    internal::partial::is_reserved_name,
     path::RelPath,
 };
 use mtp_rs::{CancelToken, ObjectHandle, ObjectInfo, Storage};
 use std::collections::HashSet;
 
 const DUPLICATE_NAME: &str = "duplicate name in folder";
+const RESERVED_NAME: &str = "name ends with a suffix mtpx reserves for transfers in progress";
 const LISTED_TWICE: &str = "folder listed twice";
 
 /// One folder's children with their paths, plus every object that could not be named under it.
@@ -26,9 +29,7 @@ pub(super) struct Walked {
     pub skipped: Vec<SkippedEntry>,
 }
 
-/// Lists the folder `parent` (`None` for the storage root) whose path is `parent_path`.
-///
-/// Device-side skips and unnameable or duplicate names land in `skipped` under `parent_path`.
+/// Lists folder `parent` under `parent_path`; skips, dupes, and unnameable objects land in `skipped`.
 pub(super) async fn list_folder(
     storage: &Storage,
     parent: Option<ObjectHandle>,
@@ -38,46 +39,59 @@ pub(super) async fn list_folder(
     let collection = storage
         .collect_objects_with_cancel(parent, cancel)
         .await
-        .map_err(Error::from_mtp)?;
-    let mut listing = classify(parent_path, &collection.objects);
-    listing
-        .skipped
-        .extend(collection.skipped.iter().map(|skipped| SkippedEntry {
-            parent: parent_path.clone(),
-            reason: skipped.error.to_string(),
-        }));
+        .map_err(Error::from)?;
+    let mut listing = classify(parent_path, collection.objects);
+    for refused in collection.skipped {
+        tracing::warn!(parent = %sanitize_for_display(&parent_path.to_string()), handle = refused.handle.0, error = %refused.error, "device refused to describe an object");
+        listing.skipped.push(SkippedEntry::new(
+            parent_path.clone(),
+            refused.error.to_string(),
+        ));
+    }
     Ok(listing)
 }
 
-/// Names every object under `parent_path`; the first object with a given name wins.
-fn classify(parent_path: &RelPath, objects: &[ObjectInfo]) -> Listing {
+/// Names every object under `parent_path`. The first object with a given name wins, which
+/// guards devices whose media index drifts from the filesystem.
+fn classify(parent_path: &RelPath, objects: Vec<ObjectInfo>) -> Listing {
     let mut listing = Listing::default();
-    let mut seen = HashSet::with_capacity(objects.len());
-    for info in objects {
-        match child_path(parent_path, info, &mut seen) {
-            Ok(path) => listing.children.push((path, info.clone())),
+    let repeated = repeated_names(&objects);
+    for (info, is_repeat) in objects.into_iter().zip(repeated) {
+        match child_path(parent_path, &info, is_repeat) {
+            Ok(path) => listing.children.push((path, info)),
             Err(reason) => {
-                tracing::warn!(parent = %parent_path, filename = %info.filename, %reason, "skipping object");
-                listing.skipped.push(SkippedEntry {
-                    parent: parent_path.clone(),
-                    reason,
-                });
+                tracing::warn!(parent = %sanitize_for_display(&parent_path.to_string()), filename = %sanitize_for_display(&info.filename), %reason, "skipping object");
+                listing
+                    .skipped
+                    .push(SkippedEntry::new(parent_path.clone(), reason));
             }
         }
     }
     listing
 }
 
-fn child_path<'a>(
+fn repeated_names(objects: &[ObjectInfo]) -> Vec<bool> {
+    let mut seen = HashSet::with_capacity(objects.len());
+    objects
+        .iter()
+        .map(|info| !seen.insert(info.filename.as_str()))
+        .collect()
+}
+
+fn child_path(
     parent: &RelPath,
-    info: &'a ObjectInfo,
-    seen: &mut HashSet<&'a str>,
+    info: &ObjectInfo,
+    is_repeat: bool,
 ) -> std::result::Result<RelPath, String> {
+    // Such a name would be invisible to the local scan and would collide with the resume
+    // files of its base name, so the device does not get to plant one.
+    if is_reserved_name(&info.filename) {
+        return Err(RESERVED_NAME.to_owned());
+    }
     let path = parent
         .join(&info.filename)
         .map_err(|reason| reason.to_string())?;
-    // Duplicate names: first wins. Real devices never produce them; this guards broken firmware.
-    if !seen.insert(&info.filename) {
+    if is_repeat {
         return Err(DUPLICATE_NAME.to_owned());
     }
     Ok(path)
@@ -112,33 +126,62 @@ pub(super) async fn walk(
     Ok(walked)
 }
 
-/// Lists `parent` once and keeps only the file named `name`, as a walk of one entry.
+/// Re-reads the file seen at open with one `GetObjectInfo`, as a walk of one entry. A stale
+/// or re-purposed handle falls back to listing `parent` by name.
 ///
 /// # Errors
-/// `SourceVanished` when `name` is missing or a folder: the file went away between open and
-/// scan. `Cancelled` once the token is set, or the listing error.
+/// `SourceVanished` when the file is missing or now a folder, `Cancelled` once the token is
+/// set, or the device error.
 pub(super) async fn pick_file(
     storage: &Storage,
     parent: Option<ObjectHandle>,
-    name: &str,
+    known: &ObjectInfo,
     cancel: &CancelToken,
     on_found: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<Walked> {
     ensure_live(cancel)?;
-    let listing = list_folder(storage, parent, &RelPath::root(), Some(cancel)).await?;
-    // Sibling skips are deliberately dropped: a single-file pull only cares about this file's fate.
-    let found = listing
-        .children
-        .into_iter()
-        .find(|(_, info)| info.filename == name && !info.is_folder());
-    let Some((path, info)) = found else {
-        return Err(Error::SourceVanished(RelPath::new([name])?));
+    let info = match revalidate(storage, known).await? {
+        Some(fresh) => fresh,
+        None => find_file(storage, parent, &known.filename, cancel).await?,
     };
+    let path = RelPath::new([known.filename.as_str()])?;
     let mut walked = Walked::default();
     walked.handles.push((path.clone(), info.handle));
     walked.entries.push(entry_from(path, &info));
     on_found(1);
     Ok(walked)
+}
+
+/// The file behind `known.handle` as the device describes it now, or `None` when the handle
+/// no longer names that file. A media rescan re-keys handles while the file survives, so a
+/// stale handle means "look again by name", not "gone".
+async fn revalidate(storage: &Storage, known: &ObjectInfo) -> Result<Option<ObjectInfo>> {
+    match storage.get_object_info(known.handle).await {
+        Ok(fresh) if fresh.filename == known.filename && !fresh.is_folder() => Ok(Some(fresh)),
+        Ok(_) => Ok(None),
+        Err(e) if e.is_stale_handle() => Ok(None),
+        Err(e) => Err(Error::from(e)),
+    }
+}
+
+/// Lists `parent` once and keeps only the file named `name`.
+async fn find_file(
+    storage: &Storage,
+    parent: Option<ObjectHandle>,
+    name: &str,
+    cancel: &CancelToken,
+) -> Result<ObjectInfo> {
+    let listing = list_folder(storage, parent, &RelPath::root(), Some(cancel)).await?;
+    // Sibling skips are deliberately dropped: a single-file pull only cares about this file's fate.
+    let found = listing
+        .children
+        .into_iter()
+        .map(|(_, info)| info)
+        .find(|info| info.filename == name && !info.is_folder());
+    let Some(info) = found else {
+        return Err(Error::SourceVanished(RelPath::new([name])?));
+    };
+    Ok(info)
 }
 
 fn ensure_live(cancel: &CancelToken) -> Result<()> {
@@ -163,11 +206,8 @@ impl Walked {
     }
 
     fn skip(&mut self, parent: &RelPath, reason: &str) {
-        tracing::warn!(%parent, reason, "skipping folder");
-        self.skipped.push(SkippedEntry {
-            parent: parent.clone(),
-            reason: reason.to_owned(),
-        });
+        tracing::warn!(parent = %sanitize_for_display(&parent.to_string()), reason, "skipping folder");
+        self.skipped.push(SkippedEntry::new(parent.clone(), reason));
     }
 }
 
@@ -181,19 +221,19 @@ pub(super) fn entry_from(path: RelPath, info: &ObjectInfo) -> Entry {
         EntryKind::File => info.size,
         EntryKind::Dir => 0,
     };
-    Entry {
+    Entry::new(
         path,
         kind,
         size,
-        modified: info.modified.and_then(ModifiedTime::from_mtp),
-    }
+        info.modified.and_then(ModifiedTime::from_mtp),
+    )
 }
 
 #[cfg(test)]
 mod classify_tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{DUPLICATE_NAME, classify};
+    use super::{DUPLICATE_NAME, RESERVED_NAME, classify};
     use crate::path::RelPath;
     use mtp_rs::{ObjectHandle, ObjectInfo};
 
@@ -207,8 +247,8 @@ mod classify_tests {
     #[test]
     fn a_repeated_name_keeps_the_first_object_and_reports_the_rest() {
         let parent = RelPath::new(["DCIM"]).unwrap();
-        let objects = [object(1, "a.jpg"), object(2, "b.jpg"), object(3, "a.jpg")];
-        let listing = classify(&parent, &objects);
+        let objects = vec![object(1, "a.jpg"), object(2, "b.jpg"), object(3, "a.jpg")];
+        let listing = classify(&parent, objects);
         let named: Vec<_> = listing
             .children
             .iter()
@@ -229,8 +269,8 @@ mod classify_tests {
     #[test]
     fn an_unusable_name_is_reported_under_its_parent_with_the_path_error() {
         let parent = RelPath::root();
-        let objects = [object(1, "a/b"), object(2, ".."), object(3, "ok")];
-        let listing = classify(&parent, &objects);
+        let objects = vec![object(1, "a/b"), object(2, ".."), object(3, "ok")];
+        let listing = classify(&parent, objects);
         assert_eq!(listing.children.len(), 1);
         assert_eq!(listing.children[0].0.to_string(), "ok");
         let reasons: Vec<_> = listing.skipped.iter().map(|s| s.reason.as_str()).collect();
@@ -242,6 +282,36 @@ mod classify_tests {
             ]
         );
         assert!(listing.skipped.iter().all(|s| s.parent == parent));
+    }
+
+    #[test]
+    fn a_repeated_unusable_name_reports_the_path_error_not_the_repeat() {
+        let parent = RelPath::root();
+        let objects = vec![object(1, "a/b"), object(2, "a/b")];
+        let listing = classify(&parent, objects);
+        assert!(listing.children.is_empty());
+        assert!(
+            listing
+                .skipped
+                .iter()
+                .all(|s| s.reason == "invalid path segment: \"a/b\"")
+        );
+    }
+
+    #[test]
+    fn a_name_with_a_reserved_suffix_is_reported_and_never_listed() {
+        let parent = RelPath::root();
+        let objects = vec![
+            object(1, "clip.mtpx-part"),
+            object(2, "clip.mtpx-part.json"),
+            object(3, "clip.mtpx-part.json.tmp"),
+            object(4, "clip.mp4"),
+        ];
+        let listing = classify(&parent, objects);
+        assert_eq!(listing.children.len(), 1);
+        assert_eq!(listing.children[0].0.to_string(), "clip.mp4");
+        assert_eq!(listing.skipped.len(), 3);
+        assert!(listing.skipped.iter().all(|s| s.reason == RESERVED_NAME));
     }
 }
 
@@ -259,6 +329,7 @@ mod tests {
                 test_support::{open_device, remote, seed_tree},
             },
         },
+        planner::NameFolding,
     };
     use mtp_rs::CancelToken;
     use std::sync::{
@@ -270,7 +341,7 @@ mod tests {
     async fn scan_lists_the_whole_tree_sorted_with_kinds_and_sizes() {
         let (storage, dir, serial) = open_device("scan-tree").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &CancelToken::new())
             .await
             .unwrap();
         let found = Arc::new(AtomicU64::new(0));
@@ -308,14 +379,15 @@ mod tests {
         assert_eq!(found.load(Ordering::SeqCst), 9);
         assert!(result.snapshot.skipped().is_empty());
         assert!(result.partials.is_empty());
-        assert_eq!(result.snapshot.root(), endpoint.label());
+        assert_eq!(result.folding, NameFolding::Exact);
+        assert_eq!(result.snapshot.label(), endpoint.label());
     }
 
     #[tokio::test]
     async fn scan_from_a_non_root_root_yields_paths_relative_to_it() {
         let (storage, dir, serial) = open_device("scan-subroot").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, &remote("/DCIM"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/DCIM"), &serial, &CancelToken::new())
             .await
             .unwrap();
         let result = endpoint
@@ -344,7 +416,7 @@ mod tests {
     async fn scan_with_a_set_token_is_cancelled() {
         let (storage, dir, serial) = open_device("scan-cancelled").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &CancelToken::new())
             .await
             .unwrap();
         let cancel = CancelToken::new();
@@ -357,7 +429,7 @@ mod tests {
     async fn scan_stops_with_cancelled_when_the_token_is_set_mid_walk() {
         let (storage, dir, serial) = open_device("scan-cancel-mid-walk").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &CancelToken::new())
             .await
             .unwrap();
         let cancel = CancelToken::new();

@@ -1,25 +1,35 @@
 //! Plain-text tables for stdout: no colors, so the output pipes cleanly.
 
 use crate::ui::format;
+use console::{Alignment, measure_text_width, pad_str};
 use jiff::{Timestamp, tz::TimeZone};
 use mtpx_core::{
-    Action, DeviceSummary, EntryKind, ModifiedTime, Plan, SkipReason, Snapshot, UsbSpeed,
+    Action, DeviceSummary, Entry, EntryKind, ModifiedTime, Plan, RelPath, SkipReason, Snapshot,
+    UsbSpeed, sanitize_for_display,
 };
 
 const COLUMN_GAP: &str = "  ";
 const ABSENT: &str = "-";
 const DIR_SUFFIX: char = '/';
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
+/// The one right-aligned column of a long listing.
+const SIZE_COLUMN: usize = 1;
 
 /// Attached devices, one per row, with the index `--device` accepts.
 pub fn devices(devices: &[DeviceSummary]) -> String {
     let header = row(["INDEX", "DEVICE", "ID", "SERIAL", "SPEED"]);
     let rows = devices.iter().enumerate().map(|(index, device)| {
+        let label = sanitize_for_display(&device.label);
+        let serial = device
+            .serial
+            .as_deref()
+            .filter(|serial| !serial.is_empty())
+            .map_or_else(|| ABSENT.to_owned(), sanitize_for_display);
         row([
             &index.to_string(),
-            &device.label,
+            &label,
             &format!("{:04x}:{:04x}", device.vendor_id, device.product_id),
-            device.serial.as_deref().unwrap_or(ABSENT),
+            &serial,
             speed(device.speed),
         ])
     });
@@ -43,16 +53,15 @@ pub fn ls(snapshot: &Snapshot, long: bool) -> String {
                 kind(entry.kind),
                 &entry_size(entry.kind, entry.size),
                 &modified(entry.modified, &tz),
-                &entry.path.to_string(),
+                &format::path(&entry.path),
             ])
         })
         .collect::<Vec<_>>();
-    render(&rows, &[1])
+    render(&rows, &[SIZE_COLUMN])
 }
 
-/// A plan, one line per action that would change something; the totals stay on stderr with
-/// the progress output. Files skipped as identical are left out, since a synced tree would
-/// otherwise drown the few real actions; a conflict skip stays, being a policy decision.
+/// A plan, one line per changing action. Identical skips stay out; conflict skips stay in.
+/// Every path comes from the device, so each goes through `format::path`.
 pub fn plan(plan: &Plan) -> String {
     actions(plan.actions())
 }
@@ -63,25 +72,32 @@ fn actions(actions: &[Action]) -> String {
 
 fn action(action: &Action) -> Option<String> {
     match action {
-        Action::Mkdir { path } => Some(format!("mkdir {path}\n")),
+        Action::Mkdir { path } => Some(format!("mkdir {}\n", format::path(path))),
         Action::Copy {
             path,
             size,
             resume_from,
             ..
-        } => Some(format!(
-            "copy  {path} ({})\n",
-            copy_detail(*size, *resume_from)
-        )),
+        } => Some(copy_line(path, *size, *resume_from)),
         Action::Skip {
             reason: SkipReason::Identical,
             ..
         } => None,
-        Action::Skip { path, reason } => {
-            Some(format!("skip  {path} ({})\n", format::skip_reason(*reason)))
-        }
+        Action::Skip { path, reason } => Some(format!(
+            "skip  {} ({})\n",
+            format::path(path),
+            format::skip_reason(*reason)
+        )),
         _ => None,
     }
+}
+
+fn copy_line(path: &RelPath, size: u64, resume_from: u64) -> String {
+    format!(
+        "copy  {} ({})\n",
+        format::path(path),
+        copy_detail(size, resume_from)
+    )
 }
 
 fn copy_detail(size: u64, resume_from: u64) -> String {
@@ -95,10 +111,11 @@ fn copy_detail(size: u64, resume_from: u64) -> String {
     )
 }
 
-fn name(entry: &mtpx_core::Entry) -> String {
+fn name(entry: &Entry) -> String {
+    let shown = format::path(&entry.path);
     match entry.kind {
-        EntryKind::Dir => format!("{}{DIR_SUFFIX}\n", entry.path),
-        EntryKind::File => format!("{}\n", entry.path),
+        EntryKind::Dir => format!("{shown}{DIR_SUFFIX}\n"),
+        EntryKind::File => format!("{shown}\n"),
     }
 }
 
@@ -155,21 +172,23 @@ fn widths(rows: &[Vec<String>]) -> Vec<usize> {
         .map(|column| {
             rows.iter()
                 .filter_map(|row| row.get(column))
-                .map(|cell| cell.chars().count())
+                .map(|cell| measure_text_width(cell))
                 .max()
                 .unwrap_or(0)
         })
         .collect()
 }
 
+/// Pads by display width, so a wide label (CJK, emoji) does not shift the columns after it.
 fn line(row: &[String], widths: &[usize], right: &[usize]) -> String {
     let cells = row.iter().enumerate().map(|(column, cell)| {
         let width = widths.get(column).copied().unwrap_or(0);
-        if right.contains(&column) {
-            format!("{cell:>width$}")
+        let alignment = if right.contains(&column) {
+            Alignment::Right
         } else {
-            format!("{cell:<width$}")
-        }
+            Alignment::Left
+        };
+        pad_str(cell, width, alignment, None).into_owned()
     });
     cells
         .collect::<Vec<_>>()
@@ -183,30 +202,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
     use super::*;
-    use mtpx_core::{CopyReason, Entry, RelPath};
+    use crate::ui::test_util::device;
+    use mtpx_core::CopyReason;
 
     fn rel(path: &str) -> RelPath {
         RelPath::new(path.split('/')).unwrap()
     }
 
     fn entry(path: &str, kind: EntryKind, size: u64) -> Entry {
-        Entry {
-            path: rel(path),
-            kind,
-            size,
-            modified: None,
-        }
-    }
-
-    fn device(label: &str, serial: Option<&str>, speed: Option<UsbSpeed>) -> DeviceSummary {
-        DeviceSummary {
-            serial: serial.map(str::to_owned),
-            label: label.to_owned(),
-            vendor_id: 0x18d1,
-            product_id: 0x4ee1,
-            location_id: 1,
-            speed,
-        }
+        Entry::new(rel(path), kind, size, None)
     }
 
     #[test]
@@ -214,12 +218,28 @@ mod tests {
         let listed = [
             device("Google Pixel 9", Some("ZY22"), Some(UsbSpeed::Super)),
             device("Moto g52", None, None),
+            device("Nokia 2", Some(""), None),
         ];
         assert_eq!(
             devices(&listed),
             "INDEX  DEVICE          ID         SERIAL  SPEED\n\
              0      Google Pixel 9  18d1:4ee1  ZY22    USB 3.0 SuperSpeed\n\
-             1      Moto g52        18d1:4ee1  -       -\n"
+             1      Moto g52        18d1:4ee1  -       -\n\
+             2      Nokia 2         18d1:4ee1  -       -\n"
+        );
+    }
+
+    #[test]
+    fn devices_table_aligns_wide_characters_by_display_width() {
+        let listed = [
+            device("小米 Redmi", None, None),
+            device("Moto g52", None, None),
+        ];
+        assert_eq!(
+            devices(&listed),
+            "INDEX  DEVICE      ID         SERIAL  SPEED\n\
+             0      小米 Redmi  18d1:4ee1  -       -\n\
+             1      Moto g52    18d1:4ee1  -       -\n"
         );
     }
 
@@ -296,6 +316,32 @@ mod tests {
         assert_eq!(
             actions(&listed),
             "mkdir DCIM\ncopy  DCIM/a.jpg (2 kB)\ncopy  DCIM/b.jpg (5 kB, resume from 1 kB)\nskip  DCIM/c.jpg (conflict)\n"
+        );
+    }
+
+    #[test]
+    fn plan_lines_neutralize_control_characters_in_device_names() {
+        let listed = [
+            Action::Mkdir {
+                path: rel("\x1b[2JDCIM"),
+            },
+            Action::Copy {
+                path: rel("DCIM/\x1b[31ma.jpg"),
+                size: 1,
+                modified: None,
+                resume_from: 0,
+                reason: CopyReason::New,
+            },
+            Action::Skip {
+                path: rel("DCIM/\x07c.jpg"),
+                reason: SkipReason::Conflict,
+            },
+        ];
+        let text = actions(&listed);
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+        assert_eq!(
+            text,
+            "mkdir \u{FFFD}[2JDCIM\ncopy  DCIM/\u{FFFD}[31ma.jpg (1 B)\nskip  DCIM/\u{FFFD}c.jpg (conflict)\n"
         );
     }
 }

@@ -1,15 +1,14 @@
 //! The local filesystem as one side of a transfer: scan, stream, and resumable writes.
 
+mod folding;
 mod scan;
 
 use crate::{
     entry::ModifiedTime,
     error::{Error, Result},
     internal::{
-        endpoint::{
-            ByteStream, CHUNK_SIZE, Endpoint, Identity, ScanResult, WriteOutcome, WriteRequest,
-        },
-        partial::{Fingerprint, Sidecar, part_path, remove_partial, write_sidecar},
+        endpoint::{ByteStream, CHUNK_SIZE, Endpoint, Identity, ScanResult, WriteRequest},
+        partial::{Fingerprint, Sidecar, part_path, remove_partial, remove_sidecar, write_sidecar},
     },
     path::RelPath,
 };
@@ -27,19 +26,40 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
+/// Bytes a part may grow between two sidecar records, so a process killed mid-file loses at
+/// most this much of what already landed.
+const CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The local filesystem side of a transfer, rooted at one directory.
 #[derive(Debug, Clone)]
-pub struct LocalEndpoint {
+pub(crate) struct LocalEndpoint {
     root: PathBuf,
     peer: Identity,
+    /// When set, the scan looks at this one file and its resume files rather than the whole tree.
+    only: Option<String>,
 }
 
 impl LocalEndpoint {
     /// Wraps `root`; `peer` is the device this side exchanges files with, used to vet partials.
-    pub fn new(root: impl Into<PathBuf>, peer: Identity) -> Self {
+    pub(crate) fn new(root: impl Into<PathBuf>, peer: Identity) -> Self {
         Self {
             root: root.into(),
             peer,
+            only: None,
+        }
+    }
+
+    /// Wraps `root` for a transfer of the single file `name` directly beneath it, so a scan
+    /// never walks the siblings.
+    pub(crate) fn for_file(
+        root: impl Into<PathBuf>,
+        name: impl Into<String>,
+        peer: Identity,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            peer,
+            only: Some(name.into()),
         }
     }
 }
@@ -56,6 +76,7 @@ impl Endpoint for LocalEndpoint {
     ) -> Result<ScanResult> {
         let walker = Walker::new(
             self.root.clone(),
+            self.only.clone(),
             self.peer.clone(),
             cancel.clone(),
             on_found,
@@ -65,46 +86,58 @@ impl Endpoint for LocalEndpoint {
             .map_err(|e| Error::Io(io::Error::other(e)))?
     }
 
-    async fn read(&self, path: &RelPath, offset: u64, cancel: &CancelToken) -> Result<ByteStream> {
-        let mut file = File::open(path.to_local_path(&self.root)).await?;
-        file.seek(SeekFrom::Start(offset)).await?;
-        Ok(Box::pin(chunks(file, cancel.clone())))
+    async fn resume_offset(&self, path: &RelPath, requested: u64) -> Result<u64> {
+        let part = part_path(&path.to_local_path(&self.root));
+        effective_resume(&part, requested).await
     }
 
-    async fn write(&self, request: WriteRequest, input: ByteStream) -> Result<WriteOutcome> {
+    async fn read(&self, path: &RelPath, offset: u64, cancel: &CancelToken) -> Result<ByteStream> {
+        let full = path.to_local_path(&self.root);
+        let mut file = File::open(&full)
+            .await
+            .map_err(Error::local_io("open", &full))?;
+        file.set_max_buf_size(CHUNK_SIZE);
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(Error::local_io("seek", &full))?;
+        Ok(Box::pin(chunks(file, full, cancel.clone())))
+    }
+
+    async fn write(&self, request: WriteRequest, input: ByteStream) -> Result<()> {
         let final_path = request.path.to_local_path(&self.root);
-        let mut sidecar = sidecar_for(&self.peer, &request);
-        let mut file = prepare_part(&final_path, &mut sidecar).await?;
-        if let Err(e) = pump_into(&mut file, &mut sidecar.bytes, input).await {
-            return keep_partial(&final_path, &sidecar, e).await;
+        refuse_directory(&final_path).await?;
+        let sidecar = sidecar_for(&self.peer, &request);
+        let mut writer = PartWriter::open(final_path, sidecar).await?;
+        let pumped = writer.pump(input).await;
+        match pumped.and_then(|()| writer.expect_length(&request)) {
+            Ok(()) => writer.finish(request.modified).await,
+            Err(e) => writer.stop(e).await,
         }
-        if sidecar.bytes != request.expected_size {
-            let mismatch = length_mismatch(&request, sidecar.bytes);
-            return keep_partial(&final_path, &sidecar, mismatch).await;
-        }
-        finish(file, &final_path, request.modified).await?;
-        Ok(WriteOutcome {
-            bytes: sidecar.bytes,
-        })
     }
 
     async fn mkdir(&self, path: &RelPath) -> Result<()> {
-        tokio::fs::create_dir_all(path.to_local_path(&self.root)).await?;
-        Ok(())
+        let full = path.to_local_path(&self.root);
+        tokio::fs::create_dir_all(&full)
+            .await
+            .map_err(Error::local_io("create directory", &full))
     }
 }
 
-fn chunks(file: File, cancel: CancelToken) -> impl Stream<Item = Result<Bytes>> + Send {
-    futures::stream::unfold(Some((file, cancel)), |state| async move {
-        let (mut file, cancel) = state?;
+fn chunks(
+    file: File,
+    path: PathBuf,
+    cancel: CancelToken,
+) -> impl Stream<Item = Result<Bytes>> + Send {
+    futures::stream::unfold(Some((file, path, cancel)), |state| async move {
+        let (mut file, path, cancel) = state?;
         if cancel.is_cancelled() {
             return Some((Err(Error::Cancelled), None));
         }
         let mut buffer = BytesMut::with_capacity(CHUNK_SIZE);
         match file.read_buf(&mut buffer).await {
             Ok(0) => None,
-            Ok(_) => Some((Ok(buffer.freeze()), Some((file, cancel)))),
-            Err(e) => Some((Err(e.into()), None)),
+            Ok(_) => Some((Ok(buffer.freeze()), Some((file, path, cancel)))),
+            Err(e) => Some((Err(Error::local_io("read", &path)(e)), None)),
         }
     })
 }
@@ -122,21 +155,150 @@ fn sidecar_for(peer: &Identity, request: &WriteRequest) -> Sidecar {
     )
 }
 
-/// Creates the parent, settles the resume offset against the disk, and opens the part file.
-async fn prepare_part(final_path: &Path, sidecar: &mut Sidecar) -> Result<File> {
-    if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+/// A directory at the final path can never be replaced by a file; refusing it up front keeps
+/// the part and sidecar from ever being created next to it.
+async fn refuse_directory(final_path: &Path) -> Result<()> {
+    match tokio::fs::metadata(final_path).await {
+        Ok(meta) if meta.is_dir() => Err(Error::LocalIo {
+            op: "write",
+            path: final_path.to_path_buf(),
+            source: io::ErrorKind::IsADirectory.into(),
+        }),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::local_io("stat", final_path)(e)),
     }
-    let part = part_path(final_path);
-    sidecar.bytes = effective_resume(&part, sidecar.bytes).await?;
-    // The sidecar lands before the first byte so that a crash at any later point leaves a
-    // record that describes the part; without one, the part is orphaned and never resumed.
-    write_sidecar(final_path, sidecar).await?;
-    open_part(&part, sidecar.bytes).await
 }
 
-/// Any disagreement between the plan's offset and the part on disk invalidates the resume:
-/// the part changed since planning, so neither number can be trusted and the write restarts.
+/// A part file open for appending, with the record that describes it if the write stops early.
+struct PartWriter {
+    file: File,
+    part: PathBuf,
+    final_path: PathBuf,
+    sidecar: Sidecar,
+    /// False when the offset was reset after the source stream was opened at the planned one:
+    /// the bytes that follow are a stale tail, and nothing may advertise them as a prefix.
+    resumable: bool,
+    checkpointed: u64,
+}
+
+impl PartWriter {
+    async fn open(final_path: PathBuf, mut sidecar: Sidecar) -> Result<Self> {
+        ensure_parent(&final_path).await?;
+        let part = part_path(&final_path);
+        let planned = sidecar.bytes;
+        sidecar.bytes = effective_resume(&part, planned).await?;
+        let resumable = sidecar.bytes == planned;
+        // The old record must go before the part regrows past its count, or it would vouch
+        // for a stale tail.
+        if !resumable {
+            remove_sidecar(&final_path).await?;
+        }
+        let file = open_part(&part, sidecar.bytes).await?;
+        Ok(Self {
+            file,
+            part,
+            final_path,
+            resumable,
+            checkpointed: sidecar.bytes,
+            sidecar,
+        })
+    }
+
+    /// Flushes even after a failed chunk, then trusts the disk over the counter: tokio
+    /// completes file writes in the background, so a late failure leaves the count ahead of
+    /// the part, and the part on disk is always a prefix of what was counted.
+    async fn pump(&mut self, input: ByteStream) -> Result<()> {
+        let copied = self.copy_chunks(input).await;
+        let flushed = self.flush().await;
+        self.sidecar.bytes = self.landed().await;
+        copied.and(flushed)
+    }
+
+    async fn copy_chunks(&mut self, mut input: ByteStream) -> Result<()> {
+        while let Some(item) = input.next().await {
+            let chunk = item?;
+            self.file
+                .write_all(&chunk)
+                .await
+                .map_err(Error::local_io("write", &self.part))?;
+            self.sidecar.bytes += chunk.len() as u64;
+            if self.resumable && self.sidecar.bytes - self.checkpointed >= CHECKPOINT_BYTES {
+                self.checkpoint().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn checkpoint(&mut self) -> Result<()> {
+        self.flush().await?;
+        write_sidecar(&self.final_path, &self.sidecar).await?;
+        self.checkpointed = self.sidecar.bytes;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.file
+            .flush()
+            .await
+            .map_err(Error::local_io("write", &self.part))
+    }
+
+    async fn landed(&self) -> u64 {
+        let counted = self.sidecar.bytes;
+        self.file
+            .metadata()
+            .await
+            .map_or(counted, |meta| counted.min(meta.len()))
+    }
+
+    fn expect_length(&self, request: &WriteRequest) -> Result<()> {
+        if self.sidecar.bytes == request.expected_size {
+            return Ok(());
+        }
+        Err(Error::LengthMismatch {
+            path: request.path.clone(),
+            expected: request.expected_size,
+            actual: self.sidecar.bytes,
+        })
+    }
+
+    /// Keeps whatever lets the next run resume, or nothing when the bytes were a stale tail.
+    async fn stop(self, error: Error) -> Result<()> {
+        if self.resumable {
+            return keep_partial(&self.final_path, &self.sidecar, error).await;
+        }
+        discard_partial(&self.final_path, error).await
+    }
+
+    /// Every byte is on disk, so a failure while committing keeps the full part and the next
+    /// run only finalises it instead of streaming the file again.
+    async fn finish(self, modified: Option<ModifiedTime>) -> Result<()> {
+        let Self {
+            file,
+            part,
+            final_path,
+            sidecar,
+            ..
+        } = self;
+        match commit(file, &part, &final_path, modified).await {
+            Ok(()) => Ok(()),
+            Err(e) => keep_partial(&final_path, &sidecar, e).await,
+        }
+    }
+}
+
+async fn ensure_parent(final_path: &Path) -> Result<()> {
+    let Some(parent) = final_path.parent() else {
+        return Ok(());
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(Error::local_io("create directory", parent))
+}
+
+/// A part shorter than the plan's offset changed since planning, so the write restarts from
+/// zero; a longer one keeps its planned prefix, and `open_part` drops the tail beyond it.
 async fn effective_resume(part: &Path, requested: u64) -> Result<u64> {
     if requested == 0 {
         return Ok(0);
@@ -144,79 +306,110 @@ async fn effective_resume(part: &Path, requested: u64) -> Result<u64> {
     let on_disk = match tokio::fs::metadata(part).await {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(Error::local_io("stat", part)(e)),
     };
-    if on_disk == requested {
+    if on_disk >= requested {
         return Ok(requested);
     }
     tracing::warn!(
         part = %part.display(),
         requested,
         on_disk,
-        "partial file changed since planning; restarting from zero"
+        "partial file shrank since planning; restarting from zero"
     );
     Ok(0)
 }
 
 async fn open_part(part: &Path, resume_from: u64) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true);
-    if resume_from > 0 {
-        options.append(true);
+    let mut file = if resume_from == 0 {
+        File::create(part)
+            .await
+            .map_err(Error::local_io("open", part))?
     } else {
-        options.write(true).truncate(true);
+        open_resumed(part, resume_from).await?
+    };
+    file.set_max_buf_size(CHUNK_SIZE);
+    Ok(file)
+}
+
+/// Opens an existing part for appending at `resume_from`. The length is re-checked through the
+/// handle, not the path, so a part replaced between the probe and the open fails here instead
+/// of landing a hole in the final file; an unverified tail past the checkpoint is dropped.
+async fn open_resumed(part: &Path, resume_from: u64) -> Result<File> {
+    let file = OpenOptions::new()
+        .append(true)
+        .open(part)
+        .await
+        .map_err(Error::local_io("open", part))?;
+    if on_disk_len(&file, part).await? < resume_from {
+        let changed = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial file changed while opening",
+        );
+        return Err(Error::local_io("open", part)(changed));
     }
-    Ok(options.open(part).await?)
+    file.set_len(resume_from)
+        .await
+        .map_err(Error::local_io("truncate", part))?;
+    Ok(file)
 }
 
-/// Flushes even after a failed chunk: tokio completes file writes in the background, and the
-/// sidecar must not be written before every byte it counts has reached the part.
-async fn pump_into(file: &mut File, bytes: &mut u64, input: ByteStream) -> Result<()> {
-    let copied = copy_chunks(file, bytes, input).await;
-    let flushed = file.flush().await.map_err(Error::from);
-    copied.and(flushed)
+async fn on_disk_len(file: &File, part: &Path) -> Result<u64> {
+    let meta = file
+        .metadata()
+        .await
+        .map_err(Error::local_io("stat", part))?;
+    Ok(meta.len())
 }
 
-async fn copy_chunks(file: &mut File, bytes: &mut u64, mut input: ByteStream) -> Result<()> {
-    while let Some(item) = input.next().await {
-        let chunk = item?;
-        file.write_all(&chunk).await?;
-        *bytes += chunk.len() as u64;
+async fn discard_partial(final_path: &Path, error: Error) -> Result<()> {
+    if let Err(e) = remove_partial(final_path).await {
+        tracing::warn!(path = %final_path.display(), error = %e, "could not drop stale partial");
     }
-    Ok(())
+    Err(error)
 }
 
-/// Records how far the part got so the next run can resume, then hands back the original error.
-async fn keep_partial(final_path: &Path, sidecar: &Sidecar, error: Error) -> Result<WriteOutcome> {
+async fn keep_partial(final_path: &Path, sidecar: &Sidecar, error: Error) -> Result<()> {
     if let Err(e) = write_sidecar(final_path, sidecar).await {
         tracing::warn!(path = %final_path.display(), error = %e, "could not update sidecar");
     }
     Err(error)
 }
 
-fn length_mismatch(request: &WriteRequest, actual: u64) -> Error {
-    Error::LengthMismatch {
-        path: request.path.clone(),
-        expected: request.expected_size,
-        actual,
-    }
-}
-
-async fn finish(file: File, final_path: &Path, modified: Option<ModifiedTime>) -> Result<()> {
-    file.sync_all().await?;
-    // Closed before the rename so no handle outlives the part.
-    drop(file);
-    let part = part_path(final_path);
-    if let Some(modified) = modified {
-        filetime::set_file_mtime(&part, modified.as_system().into())?;
-    }
-    tokio::fs::rename(&part, final_path).await?;
-    // A crash between the rename and this removal leaves an orphan sidecar with no part;
-    // scans ignore it, and a later cleanup command may remove it.
-    if let Err(e) = remove_partial(final_path).await {
+async fn commit(
+    file: File,
+    part: &Path,
+    final_path: &Path,
+    modified: Option<ModifiedTime>,
+) -> Result<()> {
+    sync(file, part, modified).await?;
+    tokio::fs::rename(part, final_path)
+        .await
+        .map_err(Error::local_io("rename", part))?;
+    // A crash before this removal leaves an orphan sidecar with no part, which scans ignore.
+    if let Err(e) = remove_sidecar(final_path).await {
         tracing::warn!(path = %final_path.display(), error = %e, "could not remove sidecar");
     }
     Ok(())
+}
+
+/// Stamps the mtime and syncs through the open handle on the blocking pool. The stamp is
+/// best-effort: a mount that refuses it must not fail a file whose every byte landed. The
+/// handle is dropped inside the closure so nothing outlives the part at rename time.
+async fn sync(file: File, part: &Path, modified: Option<ModifiedTime>) -> Result<()> {
+    let file = file.into_std().await;
+    let stamp = modified.map(ModifiedTime::as_system);
+    let shown = part.display().to_string();
+    let synced = tokio::task::spawn_blocking(move || {
+        let stamped = stamp.map_or(Ok(()), |stamp| file.set_modified(stamp));
+        if let Err(e) = stamped {
+            tracing::warn!(path = %shown, error = %e, "could not set modification time");
+        }
+        file.sync_all()
+    })
+    .await
+    .map_err(io::Error::other)?;
+    synced.map_err(Error::local_io("sync", part))
 }
 
 #[cfg(test)]
@@ -224,42 +417,24 @@ pub(super) mod test_support {
     #![allow(clippy::unwrap_used)]
 
     use super::LocalEndpoint;
-    use crate::{
-        entry::ModifiedTime,
-        internal::{
-            endpoint::{Endpoint, Identity, ScanResult},
-            partial::{Fingerprint, Sidecar, part_path, sidecar_path},
-        },
-        path::RelPath,
+    use crate::internal::{
+        endpoint::{Endpoint, Identity, ScanResult},
+        partial::{Fingerprint, Sidecar, part_path, sidecar_path},
     };
+    pub(crate) use crate::test_support::{at, rel};
     use mtp_rs::CancelToken;
-    use std::{
-        fs,
-        sync::Arc,
-        time::{Duration, UNIX_EPOCH},
-    };
+    use std::{fs, sync::Arc};
     use tempfile::TempDir;
 
-    pub fn identity(serial: &str) -> Identity {
-        Identity {
-            device_serial: serial.into(),
-            storage: "Internal".into(),
-        }
+    pub(crate) fn identity(serial: &str) -> Identity {
+        crate::test_support::identity(serial, "Internal")
     }
 
-    pub fn endpoint(dir: &TempDir) -> LocalEndpoint {
+    pub(crate) fn endpoint(dir: &TempDir) -> LocalEndpoint {
         LocalEndpoint::new(dir.path(), identity("ZY22"))
     }
 
-    pub fn rel(path: &str) -> RelPath {
-        RelPath::new(path.split('/')).unwrap()
-    }
-
-    pub fn at(seconds: u64) -> ModifiedTime {
-        ModifiedTime::from_system(UNIX_EPOCH + Duration::from_secs(seconds))
-    }
-
-    pub fn write_valid_partial(
+    pub(crate) fn write_valid_partial(
         dir: &TempDir,
         name: &str,
         serial: &str,
@@ -277,7 +452,7 @@ pub(super) mod test_support {
         fs::write(sidecar_path(&final_path), json).unwrap();
     }
 
-    pub async fn scan(local: &LocalEndpoint) -> ScanResult {
+    pub(crate) async fn scan(local: &LocalEndpoint) -> ScanResult {
         local
             .scan(&CancelToken::new(), Arc::new(|_| {}))
             .await
@@ -313,13 +488,16 @@ mod tests {
         }
     }
 
+    fn sidecar_bytes(final_path: &Path) -> u64 {
+        read_sidecar_blocking(final_path).unwrap().unwrap().bytes
+    }
+
     #[tokio::test]
     async fn full_write_lands_the_file_with_its_mtime_and_no_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let local = endpoint(&dir);
         let input = stream(ok_chunks(&[b"hello ", b"world"]));
-        let outcome = local.write(request("a/b.txt", 11, 0), input).await.unwrap();
-        assert_eq!(outcome, WriteOutcome { bytes: 11 });
+        local.write(request("a/b.txt", 11, 0), input).await.unwrap();
         let final_path = dir.path().join("a/b.txt");
         assert_eq!(fs::read(&final_path).unwrap(), b"hello world");
         let mtime =
@@ -332,11 +510,10 @@ mod tests {
     #[tokio::test]
     async fn empty_write_lands_an_empty_file_and_no_leftovers() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = endpoint(&dir)
+        endpoint(&dir)
             .write(request("empty.bin", 0, 0), stream(Vec::new()))
             .await
             .unwrap();
-        assert_eq!(outcome, WriteOutcome { bytes: 0 });
         let final_path = dir.path().join("empty.bin");
         assert_eq!(fs::read(&final_path).unwrap(), b"");
         assert!(!part_path(&final_path).exists());
@@ -376,6 +553,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_sidecar_exists_until_the_write_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        let final_path = dir.path().join("f.bin");
+        let probe = final_path.clone();
+        let items = futures::stream::unfold(0, move |sent| {
+            let probe = probe.clone();
+            async move {
+                match sent {
+                    0 => Some((Ok(Bytes::from_static(b"abc")), 1)),
+                    1 => {
+                        assert!(
+                            !sidecar_path(&probe).exists(),
+                            "sidecar written before a stop"
+                        );
+                        Some((Err(Error::Cancelled), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        local
+            .write(request("f.bin", 100, 0), Box::pin(items))
+            .await
+            .unwrap_err();
+        assert_eq!(sidecar_bytes(&final_path), 3);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_records_the_bytes_landed_so_far_while_the_stream_is_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        let final_path = dir.path().join("big.bin");
+        let probe = final_path.clone();
+        let pieces = usize::try_from(CHECKPOINT_BYTES).unwrap() / CHUNK_SIZE;
+        let items = futures::stream::unfold(0, move |sent| {
+            let probe = probe.clone();
+            async move {
+                if sent < pieces {
+                    return Some((Ok(Bytes::from(vec![7; CHUNK_SIZE])), sent + 1));
+                }
+                if sent == pieces {
+                    assert_eq!(sidecar_bytes(&probe), CHECKPOINT_BYTES);
+                    return Some((Err(Error::Cancelled), sent + 1));
+                }
+                None
+            }
+        });
+        local
+            .write(request("big.bin", CHECKPOINT_BYTES * 2, 0), Box::pin(items))
+            .await
+            .unwrap_err();
+        assert_eq!(sidecar_bytes(&final_path), CHECKPOINT_BYTES);
+        let part = fs::metadata(part_path(&final_path)).unwrap().len();
+        assert_eq!(part, CHECKPOINT_BYTES);
+    }
+
+    #[tokio::test]
     async fn resuming_from_the_part_length_completes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let local = endpoint(&dir);
@@ -383,8 +618,7 @@ mod tests {
         items.push(Err(Error::Cancelled));
         let _ = local.write(request("f.bin", 12, 0), stream(items)).await;
         let input = stream(ok_chunks(&[b"!!"]));
-        let outcome = local.write(request("f.bin", 12, 10), input).await.unwrap();
-        assert_eq!(outcome.bytes, 12);
+        local.write(request("f.bin", 12, 10), input).await.unwrap();
         let final_path = dir.path().join("f.bin");
         assert_eq!(fs::read(&final_path).unwrap(), b"helloworld!!");
         assert!(!part_path(&final_path).exists());
@@ -396,11 +630,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let local = endpoint(&dir);
         write_valid_partial(&dir, "f.bin", "ZY22", b"whole", 5);
-        let outcome = local
+        local
             .write(request("f.bin", 5, 5), stream(Vec::new()))
             .await
             .unwrap();
-        assert_eq!(outcome, WriteOutcome { bytes: 5 });
         let final_path = dir.path().join("f.bin");
         assert_eq!(fs::read(&final_path).unwrap(), b"whole");
         let mtime =
@@ -408,6 +641,16 @@ mod tests {
         assert_eq!(mtime, at(1_700_000_000));
         assert!(!part_path(&final_path).exists());
         assert!(!sidecar_path(&final_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_resume_drops_the_unverified_tail_beyond_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        write_valid_partial(&dir, "f.bin", "ZY22", b"helloworldJUNK", 10);
+        let input = stream(ok_chunks(&[b"!!"]));
+        local.write(request("f.bin", 12, 10), input).await.unwrap();
+        assert_eq!(fs::read(dir.path().join("f.bin")).unwrap(), b"helloworld!!");
     }
 
     #[tokio::test]
@@ -432,21 +675,58 @@ mod tests {
         );
         let final_path = dir.path().join("f.bin");
         assert_eq!(fs::read(part_path(&final_path)).unwrap(), b"abc");
-        assert_eq!(
-            read_sidecar_blocking(&final_path).unwrap().unwrap().bytes,
-            3
-        );
+        assert_eq!(sidecar_bytes(&final_path), 3);
     }
 
     #[tokio::test]
     async fn resume_offset_that_disagrees_with_the_part_restarts_from_zero() {
         let dir = tempfile::tempdir().unwrap();
         let local = endpoint(&dir);
-        write_valid_partial(&dir, "f.bin", "ZY22", b"stale", 5);
+        write_valid_partial(&dir, "f.bin", "ZY22", b"st", 5);
         let input = stream(ok_chunks(&[b"fresh"]));
-        let outcome = local.write(request("f.bin", 5, 3), input).await.unwrap();
-        assert_eq!(outcome.bytes, 5);
+        local.write(request("f.bin", 5, 3), input).await.unwrap();
         assert_eq!(fs::read(dir.path().join("f.bin")).unwrap(), b"fresh");
+    }
+
+    #[tokio::test]
+    async fn invalidated_tail_is_dropped_instead_of_kept_as_a_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        write_valid_partial(&dir, "f.bin", "ZY22", b"st", 5);
+        let input = stream(ok_chunks(&[b"DE"]));
+        let err = local
+            .write(request("f.bin", 5, 3), input)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::LengthMismatch { .. }), "{err:?}");
+        let final_path = dir.path().join("f.bin");
+        assert!(!final_path.exists());
+        assert!(!part_path(&final_path).exists());
+        assert!(!sidecar_path(&final_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_finish_records_the_full_part_for_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        let final_path = dir.path().join("f.bin");
+        let mut writer = PartWriter::open(
+            final_path.clone(),
+            sidecar_for(&local.peer, &request("f.bin", 5, 0)),
+        )
+        .await
+        .unwrap();
+        writer.pump(stream(ok_chunks(&[b"hello"]))).await.unwrap();
+        fs::create_dir(&final_path).unwrap();
+        fs::write(final_path.join("keep"), b"k").unwrap();
+        let err = writer.finish(Some(at(1))).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::LocalIo { op: "rename", .. }),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(part_path(&final_path)).unwrap(), b"hello");
+        assert_eq!(sidecar_bytes(&final_path), 5);
+        assert_eq!(fs::read(final_path.join("keep")).unwrap(), b"k");
     }
 
     #[tokio::test]
@@ -475,6 +755,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_fills_whole_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("big.bin"), vec![7; CHUNK_SIZE + 1]).unwrap();
+        let chunks: Vec<_> = endpoint(&dir)
+            .read(&rel("big.bin"), 0, &CancelToken::new())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let lengths: Vec<_> = chunks.iter().map(|c| c.as_ref().unwrap().len()).collect();
+        assert_eq!(lengths, [CHUNK_SIZE, 1]);
+    }
+
+    #[tokio::test]
+    async fn read_of_a_missing_file_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(err) = endpoint(&dir)
+            .read(&rel("nope.txt"), 0, &CancelToken::new())
+            .await
+        else {
+            panic!("a missing file opened");
+        };
+        assert!(matches!(&err, Error::LocalIo { op: "open", .. }), "{err:?}");
+        assert!(err.to_string().contains("nope.txt"), "{err}");
+    }
+
+    #[tokio::test]
     async fn read_ends_with_cancelled_once_the_token_is_set() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"hello").unwrap();
@@ -494,5 +801,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         endpoint(&dir).mkdir(&rel("x/y/z")).await.unwrap();
         assert!(dir.path().join("x/y/z").is_dir());
+    }
+
+    #[tokio::test]
+    async fn write_over_a_directory_is_refused_before_anything_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/keep.txt"), b"keep").unwrap();
+        let err = endpoint(&dir)
+            .write(request("sub", 1, 0), stream(ok_chunks(&[b"x"])))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::LocalIo { op: "write", .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("sub"), "{err}");
+        assert_eq!(fs::read(dir.path().join("sub/keep.txt")).unwrap(), b"keep");
+        let final_path = dir.path().join("sub");
+        assert!(final_path.is_dir());
+        assert!(!part_path(&final_path).exists());
+        assert!(!sidecar_path(&final_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_directory_in_the_way_of_the_part_names_the_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("a.jpg");
+        fs::create_dir(part_path(&final_path)).unwrap();
+        let err = endpoint(&dir)
+            .write(request("a.jpg", 1, 0), stream(ok_chunks(&[b"x"])))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::LocalIo { op: "open", .. }), "{err:?}");
+        assert!(err.to_string().contains("a.jpg.mtpx-part"), "{err}");
+        assert!(!sidecar_path(&final_path).exists());
+    }
+
+    #[tokio::test]
+    async fn mkdir_over_a_file_fails_and_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("taken"), b"data").unwrap();
+        let err = endpoint(&dir).mkdir(&rel("taken")).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::LocalIo {
+                    op: "create directory",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(dir.path().join("taken")).unwrap(), b"data");
     }
 }

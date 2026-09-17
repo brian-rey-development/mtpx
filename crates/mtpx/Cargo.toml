@@ -1,7 +1,7 @@
 [package]
 name = "mtpx"
-version = "0.1.0"
-description = "rsync for your phone. Fast, incremental file transfers over MTP, in pure Rust"
+version.workspace = true
+description = "rsync for your phone: fast, incremental file transfers over MTP, in pure Rust"
 keywords = ["mtp", "android", "sync", "cli", "rsync"]
 categories = ["command-line-utilities", "filesystem"]
 edition.workspace = true
@@ -20,10 +20,10 @@ clap = { workspace = true, features = ["derive", "wrap_help"] }
 indicatif = { workspace = true }
 console = { workspace = true }
 dialoguer = { workspace = true }
-miette = { workspace = true, features = ["fancy"] }
+miette = { workspace = true, features = ["fancy-no-backtrace"] }
 humansize = { workspace = true }
 jiff = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
@@ -34,3 +34,8 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "cli"
+path = "tests/cli/main.rs"
+required-features = ["virtual-device"]

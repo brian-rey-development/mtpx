@@ -51,7 +51,19 @@ fn ls_long_prints_kind_size_and_name() {
         ));
 }
 
-/// A tree whose recursive listing overflows the pipe buffer; returns the long directory name.
+#[test]
+fn ls_neutralizes_control_characters_in_device_names() {
+    let phone = Phone::empty();
+    phone.seed("DCIM/a\x1b[31mRED\x1b[0m.jpg", b"x");
+    phone
+        .mtpx()
+        .args(["ls", "/DCIM"])
+        .assert()
+        .code(0)
+        .stdout("a\u{FFFD}[31mRED\u{FFFD}[0m.jpg\n");
+}
+
+/// Returns the directory name the files were seeded under.
 fn seed_many_files(phone: &Phone) -> String {
     let dir = "d".repeat(LONG_DIR_NAME_LEN);
     for index in 0..MANY_FILES {

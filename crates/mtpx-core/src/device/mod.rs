@@ -42,15 +42,18 @@ impl Device {
     /// Opens the device `selector` picks out of [`discovery::list_devices`] and reads its storages.
     ///
     /// # Errors
-    /// `NoDevice` when nothing matches, `AmbiguousDevice` when `Only` finds several,
-    /// `ExclusiveAccess` or `PermissionDenied` when the OS refuses the USB interface,
-    /// `DeviceUnresponsive` when the phone never answers the first command,
-    /// `Disconnected` when the device was unplugged between listing and opening.
+    /// `NoDevice` when nothing is attached or the device was unplugged between listing and
+    /// opening, `DeviceNotFound` when `selector` names a serial or index no attached device
+    /// has, `AmbiguousDevice` when `Only` finds several, `ExclusiveAccess` or
+    /// `PermissionDenied` when the OS refuses the USB interface, `DeviceUnresponsive` when the
+    /// phone never answers the first command, `Disconnected` when the transport drops while
+    /// the session is being opened.
     pub async fn open(selector: &DeviceSelector) -> Result<Self> {
-        let summary = discovery::select_device(discovery::list_devices()?, selector)?;
-        let opened = match summary.serial.as_deref() {
-            Some(serial) if !serial.is_empty() => MtpDevice::open_by_serial(serial).await,
-            _ => MtpDevice::open_by_location(summary.location_id).await,
+        let devices = discovery::list_devices()?;
+        let summary = discovery::select_device(devices.clone(), selector)?;
+        let opened = match unique_serial(&devices, &summary) {
+            Some(serial) => MtpDevice::open_by_serial(serial).await,
+            None => MtpDevice::open_by_location(summary.location_id).await,
         };
         Self::load(answered(opened)?, summary).await
     }
@@ -67,7 +70,7 @@ impl Device {
         let registration = VirtualRegistration(info.location_id);
         let opened = MtpDevice::builder().open_virtual(config).await;
         let summary = DeviceSummary::from_mtp(info);
-        let mut device = Self::load(opened.map_err(Error::from_mtp)?, summary).await?;
+        let mut device = Self::load(opened?, summary).await?;
         device.registration = Some(registration);
         Ok(device)
     }
@@ -88,12 +91,6 @@ impl Device {
         &self.summary
     }
 
-    /// Human-readable name, such as "Google Pixel 9".
-    #[must_use]
-    pub fn label(&self) -> String {
-        self.summary.label.clone()
-    }
-
     /// Serial number the device reports in its MTP `DeviceInfo`.
     ///
     /// May differ from [`DeviceSummary::serial`], which is the USB descriptor serial and can be
@@ -101,6 +98,16 @@ impl Device {
     #[must_use]
     pub fn serial(&self) -> &str {
         &self.inner.device_info().serial_number
+    }
+
+    /// The serial a resume sidecar is keyed by: the MTP one, or the USB descriptor's when the
+    /// device leaves the MTP field empty. Empty when neither exists, which disables resume.
+    fn identity_serial(&self) -> &str {
+        let mtp = self.serial();
+        if !mtp.is_empty() {
+            return mtp;
+        }
+        self.summary.serial.as_deref().unwrap_or_default()
     }
 
     /// Every storage on the device, in enumeration order.
@@ -116,15 +123,16 @@ impl Device {
     /// Lists `path`: its immediate children, or the whole subtree sorted by path when `recursive`.
     ///
     /// # Errors
-    /// `RemotePathNotFound` or `NotADirectory` for the path, `StorageRequired` or
-    /// `StorageNotFound` for the storage, `Cancelled` once the token is set.
+    /// `RemotePathNotFound`, `RemotePathUndescribed` or `NotADirectory` for the path,
+    /// `StorageRequired`, `NoStorage` or `StorageNotFound` for the storage, `Cancelled` once
+    /// the token is set.
     pub async fn ls(
         &self,
         path: &DevicePath,
         recursive: bool,
         cancel: &CancelToken,
     ) -> Result<Snapshot> {
-        let endpoint = self.endpoint(path).await?;
+        let endpoint = self.endpoint(path, cancel).await?;
         if endpoint.is_file() {
             return Err(Error::NotADirectory(path.clone()));
         }
@@ -139,15 +147,14 @@ impl Device {
     /// `CloseSession` command, which some devices need before they leave MTP mode.
     ///
     /// # Errors
-    /// Currently never fails; the `Result` exists so a future backend can report a failed
-    /// `CloseSession`.
+    /// `Error::Mtp` when `CloseSession` fails.
     pub async fn close(self) -> Result<()> {
-        self.inner.close().await.map_err(Error::from_mtp)
+        self.inner.close().await.map_err(Error::from)
     }
 
-    async fn endpoint(&self, path: &DevicePath) -> Result<MtpEndpoint> {
+    async fn endpoint(&self, path: &DevicePath, cancel: &CancelToken) -> Result<MtpEndpoint> {
         let storage = self.select_storage(&path.storage)?;
-        MtpEndpoint::open(storage, path, self.serial()).await
+        MtpEndpoint::open(storage, path, self.identity_serial(), cancel).await
     }
 
     fn select_storage(&self, selector: &StorageSelector) -> Result<Arc<Storage>> {
@@ -156,18 +163,26 @@ impl Device {
             StorageSelector::Index(index) => self
                 .storages
                 .get(*index)
-                .ok_or_else(|| Error::StorageNotFound(index.to_string()))?,
+                .ok_or_else(|| self.storage_not_found(index.to_string()))?,
             StorageSelector::Named(name) => self
                 .storages
                 .iter()
                 .find(|storage| is_named(storage.info(), name))
-                .ok_or_else(|| Error::StorageNotFound(name.clone()))?,
+                .ok_or_else(|| self.storage_not_found(name.clone()))?,
         };
         Ok(Arc::clone(found))
     }
 
+    fn storage_not_found(&self, wanted: String) -> Error {
+        Error::StorageNotFound {
+            wanted,
+            available: self.storages(),
+        }
+    }
+
     fn only_storage(&self) -> Result<&Arc<Storage>> {
         match self.storages.as_slice() {
+            [] => Err(Error::NoStorage),
             [only] => Ok(only),
             _ => Err(Error::StorageRequired(self.storages())),
         }
@@ -189,31 +204,55 @@ impl fmt::Debug for Device {
 fn answered<T>(outcome: std::result::Result<T, mtp_rs::Error>) -> Result<T> {
     match outcome {
         Err(mtp_rs::Error::Timeout) => Err(Error::DeviceUnresponsive),
-        other => other.map_err(Error::from_mtp),
+        other => other.map_err(Error::from),
     }
+}
+
+// Some firmwares ship one descriptor serial on every unit, so a shared serial cannot pick a
+// device; the bus location can.
+fn unique_serial<'a>(devices: &[DeviceSummary], chosen: &'a DeviceSummary) -> Option<&'a str> {
+    let serial = chosen
+        .serial
+        .as_deref()
+        .filter(|serial| !serial.is_empty())?;
+    let matches = devices
+        .iter()
+        .filter(|device| device.serial.as_deref() == Some(serial))
+        .count();
+    (matches == 1).then_some(serial)
 }
 
 fn storage_summary(index: usize, info: &StorageInfo) -> StorageSummary {
-    StorageSummary {
+    StorageSummary::new(
         index,
-        name: info.description.clone(),
-        free: info.free_space,
-        total: info.total_capacity,
-    }
+        info.description.clone(),
+        info.free_space,
+        info.total_capacity,
+    )
 }
 
-// Devices expose a friendly description or a stable volume id; users need not know which.
 fn is_named(info: &StorageInfo, name: &str) -> bool {
     let wanted = name.to_lowercase();
     info.description.to_lowercase() == wanted || info.volume_identifier.to_lowercase() == wanted
 }
 
 #[cfg(test)]
-mod answered_tests {
+mod open_tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::answered;
-    use crate::error::Error;
+    use super::{answered, unique_serial};
+    use crate::{discovery::DeviceSummary, error::Error};
+
+    fn device(serial: Option<&str>, location_id: u64) -> DeviceSummary {
+        DeviceSummary::new(
+            serial.map(str::to_owned),
+            "Phone".into(),
+            1,
+            2,
+            location_id,
+            None,
+        )
+    }
 
     #[test]
     fn a_timeout_on_open_is_device_unresponsive_and_the_rest_map_as_usual() {
@@ -223,43 +262,62 @@ mod answered_tests {
         assert!(matches!(err, Error::Disconnected), "{err:?}");
         assert!(answered(Ok(7)).is_ok_and(|value| value == 7));
     }
+
+    #[test]
+    fn a_serial_only_selects_a_device_when_no_other_device_shares_it() {
+        let devices = vec![
+            device(Some("A"), 1),
+            device(Some("A"), 2),
+            device(Some("B"), 3),
+            device(Some(""), 4),
+            device(None, 5),
+        ];
+        assert_eq!(unique_serial(&devices, &devices[0]), None);
+        assert_eq!(unique_serial(&devices, &devices[1]), None);
+        assert_eq!(unique_serial(&devices, &devices[2]), Some("B"));
+        assert_eq!(unique_serial(&devices, &devices[3]), None);
+        assert_eq!(unique_serial(&devices, &devices[4]), None);
+    }
 }
 
 #[cfg(all(test, feature = "virtual-device"))]
-pub mod test_support {
+pub(crate) mod test_support {
     #![allow(clippy::unwrap_used)]
 
     use super::Device;
-    use crate::{device_path::DevicePath, event::ProgressEvent};
-    use mtp_rs::{VirtualDeviceConfig, VirtualStorageConfig};
-    use std::{path::Path, time::Duration};
+    use crate::{
+        device_path::DevicePath,
+        event::ProgressEvent,
+        test_support::{virtual_config, virtual_storage},
+    };
+    use std::path::Path;
     use tempfile::TempDir;
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    pub const FIRST_STORAGE: &str = "Internal Storage";
-    pub const SECOND_STORAGE: &str = "Second";
-    pub const LABEL: &str = "mtpx Virtual Phone";
-    const CAPACITY: u64 = 1024 * 1024 * 1024;
+    pub(crate) const FIRST_STORAGE: &str = "Internal Storage";
+    pub(crate) const SECOND_STORAGE: &str = "Second";
+    pub(crate) const LABEL: &str = "mtpx Virtual Phone";
+    pub(crate) use crate::test_support::VIRTUAL_CAPACITY as CAPACITY;
     const EVENTS_CAPACITY: usize = 1024;
 
     /// An open virtual device plus the directories backing its storages, in storage order.
-    pub struct Fixture {
+    pub(crate) struct Fixture {
         pub device: Device,
         pub dirs: Vec<TempDir>,
         pub serial: String,
     }
 
     impl Fixture {
-        pub fn root(&self) -> &Path {
+        pub(crate) fn root(&self) -> &Path {
             self.dirs[0].path()
         }
     }
 
-    pub async fn open_device(test_name: &str) -> Fixture {
+    pub(crate) async fn open_device(test_name: &str) -> Fixture {
         open_with(test_name, &[FIRST_STORAGE]).await
     }
 
-    pub async fn open_two_storage_device(test_name: &str) -> Fixture {
+    pub(crate) async fn open_two_storage_device(test_name: &str) -> Fixture {
         open_with(test_name, &[FIRST_STORAGE, SECOND_STORAGE]).await
     }
 
@@ -272,9 +330,9 @@ pub mod test_support {
         let storages = descriptions
             .iter()
             .zip(&dirs)
-            .map(|(description, dir)| storage(description, dir.path()))
+            .map(|(description, dir)| virtual_storage(description, dir.path()))
             .collect();
-        let device = Device::open_virtual(config(&serial, storages))
+        let device = Device::open_virtual(virtual_config(&serial, storages))
             .await
             .unwrap();
         Fixture {
@@ -284,36 +342,15 @@ pub mod test_support {
         }
     }
 
-    fn storage(description: &str, backing_dir: &Path) -> VirtualStorageConfig {
-        VirtualStorageConfig {
-            description: description.to_owned(),
-            capacity: CAPACITY,
-            backing_dir: backing_dir.to_path_buf(),
-            read_only: false,
-        }
-    }
-
-    fn config(serial: &str, storages: Vec<VirtualStorageConfig>) -> VirtualDeviceConfig {
-        VirtualDeviceConfig {
-            manufacturer: "mtpx".into(),
-            model: "Virtual Phone".into(),
-            serial: serial.to_owned(),
-            storages,
-            event_poll_interval: Duration::ZERO,
-            watch_backing_dirs: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn device_path(input: &str) -> DevicePath {
+    pub(crate) fn device_path(input: &str) -> DevicePath {
         input.parse().unwrap()
     }
 
-    pub fn events() -> (Sender<ProgressEvent>, Receiver<ProgressEvent>) {
+    pub(crate) fn events() -> (Sender<ProgressEvent>, Receiver<ProgressEvent>) {
         mpsc::channel(EVENTS_CAPACITY)
     }
 
-    pub fn drain(rx: &mut Receiver<ProgressEvent>) -> Vec<ProgressEvent> {
+    pub(crate) fn drain(rx: &mut Receiver<ProgressEvent>) -> Vec<ProgressEvent> {
         let mut drained = Vec::new();
         while let Ok(event) = rx.try_recv() {
             drained.push(event);
@@ -359,7 +396,6 @@ mod tests {
         assert_eq!(summary.label, LABEL);
         assert_eq!(summary.speed, None);
         assert_eq!(&summary, fixture.device.summary());
-        assert_eq!(fixture.device.label(), LABEL);
         assert_eq!(fixture.device.serial(), fixture.serial);
     }
 
@@ -378,13 +414,20 @@ mod tests {
         );
     }
 
+    /// Other tests may hold virtual devices open in parallel, so the bus may or may not be
+    /// empty; either way the unknown serial matches nothing.
     #[tokio::test]
-    async fn open_by_an_unknown_serial_is_no_device() {
+    async fn open_by_an_unknown_serial_reports_no_match() {
         let selector = DeviceSelector::Serial("mtpx-device-unknown".into());
         let err = Device::open(&selector).await.unwrap_err();
-        assert!(matches!(err, Error::NoDevice), "{err:?}");
+        assert!(
+            matches!(err, Error::NoDevice | Error::DeviceNotFound { .. }),
+            "{err:?}"
+        );
     }
 
+    /// Storages are read once at open, so a second session sees the space a seeded file
+    /// took; that pins `free` and `total` independently.
     #[tokio::test]
     async fn storages_reports_index_name_and_capacity() {
         let fixture = open_device("storages").await;
@@ -392,8 +435,16 @@ mod tests {
         assert_eq!(storages.len(), 1);
         assert_eq!(storages[0].index, 0);
         assert_eq!(storages[0].name, FIRST_STORAGE);
-        assert!(storages[0].total > 0);
-        assert!(storages[0].free <= storages[0].total);
+        assert_eq!(storages[0].total, CAPACITY);
+        assert_eq!(storages[0].free, CAPACITY);
+        let used = b"0123456789";
+        fs::write(fixture.root().join("used.bin"), used).unwrap();
+        let selector = DeviceSelector::Serial(fixture.serial.clone());
+        let reopened = Device::open(&selector).await.unwrap();
+        let storages = reopened.storages();
+        assert_eq!(storages[0].total, CAPACITY);
+        assert_eq!(storages[0].free, CAPACITY - used.len() as u64);
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -433,7 +484,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&err, Error::StorageNotFound(name) if name == expected),
+                matches!(&err, Error::StorageNotFound { wanted, available }
+                    if wanted == expected && *available == fixture.device.storages()),
                 "{input}: {err:?}"
             );
         }

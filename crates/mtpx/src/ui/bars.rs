@@ -2,7 +2,7 @@
 //! bar and an overall bar.
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use mtpx_core::RelPath;
+use mtpx_core::{RelPath, sanitize_for_display};
 use std::{env, time::Duration};
 
 const SPINNER_TEMPLATE: &str = "{spinner} {msg}";
@@ -16,7 +16,7 @@ const ASCII_TICK_CHARS: &str = "|/-\\ ";
 const LOCALE_VARS: [&str; 3] = ["LC_ALL", "LC_CTYPE", "LANG"];
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Owns the bars and the `MultiProgress` that keeps them below any printed line.
+/// Owns the bars and a handle on the `MultiProgress` that keeps them below any printed line.
 pub struct Bars {
     multi: MultiProgress,
     spinner: ProgressBar,
@@ -32,10 +32,9 @@ struct Glyphs {
 }
 
 impl Bars {
-    /// Starts the scan spinner on stderr; the transfer bars stay hidden until `show_transfer`.
-    pub fn new() -> Self {
+    /// Starts the scan spinner on `multi`; the transfer bars stay hidden until `show_transfer`.
+    pub fn new(multi: MultiProgress) -> Self {
         let glyphs = glyphs(utf8_locale());
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
         let spinner = multi.add(spinner(glyphs));
         spinner.enable_steady_tick(TICK_INTERVAL);
         Self {
@@ -46,7 +45,6 @@ impl Bars {
         }
     }
 
-    /// Updates the spinner text.
     pub fn scanning(&self, message: String) {
         self.spinner.set_message(message);
     }
@@ -67,12 +65,11 @@ impl Bars {
         self.multi.add(self.overall.clone());
     }
 
-    /// Points the file bar at a new file.
     pub fn start_file(&self, path: &RelPath, size: u64, resume_from: u64) {
         self.file.reset();
         self.file.set_length(size);
         self.file.set_position(resume_from);
-        let name = path.file_name().unwrap_or_default().to_owned();
+        let name = sanitize_for_display(path.file_name().unwrap_or_default());
         self.file.set_message(name);
     }
 
@@ -82,7 +79,6 @@ impl Bars {
         self.overall.set_position(overall);
     }
 
-    /// Settles the overall bar after a file and updates its file count.
     pub fn finish_file(&self, overall: u64, done: u64, total: u64) {
         self.overall.set_position(overall);
         self.overall.set_message(file_count(done, total));
@@ -93,7 +89,6 @@ impl Bars {
         let _ = self.multi.println(line);
     }
 
-    /// Removes every bar from the terminal.
     pub fn clear(&self) {
         self.spinner.finish_and_clear();
         self.file.finish_and_clear();

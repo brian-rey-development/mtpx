@@ -9,12 +9,12 @@ use crate::{
     device_path::DevicePath,
     entry::Snapshot,
     error::{Error, Result},
-    internal::endpoint::{ByteStream, Endpoint, Identity, ScanResult, WriteOutcome, WriteRequest},
+    internal::endpoint::{ByteStream, Endpoint, Identity, ScanResult, WriteRequest},
     path::{RelPath, RemotePath},
-    planner::Partials,
+    planner::{NameFolding, Partials},
 };
 use bytes::Bytes;
-use mtp_rs::{ByteRange, CancelToken, Storage, WindowedDownload};
+use mtp_rs::{ByteRange, CancelToken, ObjectInfo, Storage, WindowedDownload};
 use resolver::Resolver;
 use std::{fmt, io, sync::Arc};
 use tokio::{
@@ -24,18 +24,21 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Bytes requested per `GetPartialObject`; no session is held between windows, so a cancel
-/// waits at most this long.
-pub const DOWNLOAD_WINDOW: u32 = 4 * 1024 * 1024;
+/// waits at most this long. Each read starts with one `GetObjectInfo` the plan could have
+/// spared; it is kept because it re-reads the size the plan was built from, so a file that
+/// grew on the device ends as a `LengthMismatch` rather than a silently truncated copy.
+pub(crate) const DOWNLOAD_WINDOW: u32 = 4 * 1024 * 1024;
 /// Windows the read pump may fetch ahead of the consumer.
-pub const PUMP_DEPTH: usize = 4;
+pub(crate) const PUMP_DEPTH: usize = 4;
 
 /// One storage on one device, rooted at a folder or a single file, as the source or destination
 /// of a transfer.
-pub struct MtpEndpoint {
+pub(crate) struct MtpEndpoint {
     storage: Arc<Storage>,
     root: RemotePath,
-    /// The file `root` names, when it is not a folder; the resolver is then rooted at its parent.
-    file: Option<String>,
+    /// The file `root` names, when it is not a folder, as seen at open; the resolver is then
+    /// rooted at its parent.
+    file: Option<ObjectInfo>,
     resolver: Resolver,
     identity: Identity,
 }
@@ -47,14 +50,16 @@ impl MtpEndpoint {
     /// shows the selector the user typed rather than the storage's own name.
     ///
     /// # Errors
-    /// `RemotePathNotFound` when a segment is missing, `NotADirectory` when a segment before the
-    /// last is a file, or the first listing error.
-    pub async fn open(
+    /// `RemotePathNotFound` or `RemotePathUndescribed` when a segment is missing,
+    /// `NotADirectory` when a segment before the last is a file, `Cancelled` once the token is
+    /// set, or the first listing error.
+    pub(crate) async fn open(
         storage: Arc<Storage>,
         path: &DevicePath,
         device_serial: &str,
+        cancel: &CancelToken,
     ) -> Result<Self> {
-        let target = open::locate_root(&storage, path).await?;
+        let target = open::locate_root(&storage, path, cancel).await?;
         let identity = Identity {
             device_serial: device_serial.to_owned(),
             storage: storage.info().description.clone(),
@@ -68,29 +73,27 @@ impl MtpEndpoint {
         })
     }
 
-    /// The device and storage this endpoint talks to.
     #[must_use]
-    pub const fn identity(&self) -> &Identity {
+    pub(crate) const fn identity(&self) -> &Identity {
         &self.identity
     }
 
-    /// Whether the root names a single file rather than a folder.
     #[must_use]
-    pub const fn is_file(&self) -> bool {
+    pub(crate) const fn is_file(&self) -> bool {
         self.file.is_some()
     }
 
-    /// Lists the root's immediate children without descending into folders; a file root lists
-    /// just that file and primes the resolver with its handle, as `scan` does.
+    #[must_use]
+    pub(crate) fn file_name(&self) -> Option<&str> {
+        self.file.as_ref().map(|info| info.filename.as_str())
+    }
+
+    /// Lists the root's immediate children without descending into folders. The root is a
+    /// folder: `Device::ls` refuses a file root before it gets here.
     ///
     /// # Errors
-    /// `SourceVanished` when a file root is gone, `Cancelled` once the token is set, or the
-    /// listing error.
-    pub async fn list(&self, cancel: &CancelToken) -> Result<Snapshot> {
-        if self.is_file() {
-            let scanned = self.scan(cancel, Arc::new(|_| {})).await?;
-            return Ok(scanned.snapshot);
-        }
+    /// `Cancelled` once the token is set, or the listing error.
+    pub(crate) async fn list(&self, cancel: &CancelToken) -> Result<Snapshot> {
         let root = RelPath::root();
         let listing =
             scan::list_folder(&self.storage, self.resolver.root(), &root, Some(cancel)).await?;
@@ -118,14 +121,23 @@ impl Endpoint for MtpEndpoint {
     ) -> Result<ScanResult> {
         let parent = self.resolver.root();
         let walked = match &self.file {
-            Some(name) => scan::pick_file(&self.storage, parent, name, cancel, &*on_found).await?,
+            Some(info) => scan::pick_file(&self.storage, parent, info, cancel, &*on_found).await?,
             None => scan::walk(&self.storage, parent, cancel, &*on_found).await?,
         };
         self.resolver.prime(walked.handles);
         Ok(ScanResult {
             snapshot: Snapshot::new(self.label(), walked.entries, walked.skipped),
             partials: Partials::default(),
+            folding: NameFolding::Exact,
         })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "resume is not implemented yet"
+    )]
+    async fn resume_offset(&self, _path: &RelPath, requested: u64) -> Result<u64> {
+        Ok(requested)
     }
 
     /// Streams the file at `path` from `offset`. `path` must name a file: the plan never emits a
@@ -133,7 +145,7 @@ impl Endpoint for MtpEndpoint {
     async fn read(&self, path: &RelPath, offset: u64, cancel: &CancelToken) -> Result<ByteStream> {
         let download = self
             .resolver
-            .with_handle(path, |handle| {
+            .with_handle(path, cancel, |handle| {
                 self.storage
                     .download_windowed(handle, ByteRange::From(offset), DOWNLOAD_WINDOW)
             })
@@ -146,15 +158,15 @@ impl Endpoint for MtpEndpoint {
 
     #[expect(
         clippy::unused_async_trait_impl,
-        reason = "upload lands with push in M3"
+        reason = "upload is not implemented yet"
     )]
-    async fn write(&self, _request: WriteRequest, _input: ByteStream) -> Result<WriteOutcome> {
+    async fn write(&self, _request: WriteRequest, _input: ByteStream) -> Result<()> {
         Err(Error::Unsupported("upload"))
     }
 
     #[expect(
         clippy::unused_async_trait_impl,
-        reason = "mkdir lands with push in M3"
+        reason = "mkdir is not implemented yet"
     )]
     async fn mkdir(&self, _path: &RelPath) -> Result<()> {
         Err(Error::Unsupported("mkdir"))
@@ -179,7 +191,7 @@ async fn pump(mut download: WindowedDownload, cancel: CancelToken, tx: Sender<Re
         } else {
             match download.next_window().await {
                 None => return,
-                Some(window) => window.map(Bytes::from).map_err(Error::from_mtp),
+                Some(window) => window.map(Bytes::from).map_err(Error::from),
             }
         };
         let last = item.is_err();
@@ -216,46 +228,35 @@ mod pump_tests {
 }
 
 #[cfg(all(test, feature = "virtual-device"))]
-pub mod test_support {
+pub(crate) mod test_support {
     #![allow(clippy::unwrap_used)]
 
-    use crate::{device_path::DevicePath, path::RelPath};
-    use mtp_rs::{MtpDevice, Storage, VirtualDeviceConfig, VirtualStorageConfig};
-    use std::{fs, path::Path, sync::Arc, time::Duration};
+    use super::{DOWNLOAD_WINDOW, PUMP_DEPTH};
+    use crate::device_path::DevicePath;
+    pub(crate) use crate::test_support::{pseudo_random, rel};
+    use crate::test_support::{virtual_config, virtual_storage};
+    use mtp_rs::{MtpDevice, Storage};
+    use std::{fs, path::Path, sync::Arc};
     use tempfile::TempDir;
 
-    pub const STORAGE_DESCRIPTION: &str = "Internal Storage";
-    const CAPACITY: u64 = 1024 * 1024 * 1024;
+    pub(crate) const STORAGE_DESCRIPTION: &str = "Internal Storage";
+    /// More windows than the pump can hold buffered plus in flight once the token is set,
+    /// so the stream cannot reach EOF before the cancel is observed.
+    pub(crate) const CANCEL_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
 
-    pub async fn open_device(test_name: &str) -> (Arc<Storage>, TempDir, String) {
+    pub(crate) async fn open_device(test_name: &str) -> (Arc<Storage>, TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let serial = format!("mtpx-{test_name}");
+        let storages = vec![virtual_storage(STORAGE_DESCRIPTION, dir.path())];
         let device = MtpDevice::builder()
-            .open_virtual(config(&serial, dir.path()))
+            .open_virtual(virtual_config(&serial, storages))
             .await
             .unwrap();
         let storage = device.storages().await.unwrap().remove(0);
         (Arc::new(storage), dir, serial)
     }
 
-    fn config(serial: &str, backing_dir: &Path) -> VirtualDeviceConfig {
-        VirtualDeviceConfig {
-            manufacturer: "mtpx".into(),
-            model: "Virtual Phone".into(),
-            serial: serial.to_owned(),
-            storages: vec![VirtualStorageConfig {
-                description: STORAGE_DESCRIPTION.into(),
-                capacity: CAPACITY,
-                backing_dir: backing_dir.to_path_buf(),
-                read_only: false,
-            }],
-            event_poll_interval: Duration::ZERO,
-            watch_backing_dirs: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn seed_tree(root: &Path) {
+    pub(crate) fn seed_tree(root: &Path) {
         for dir in ["DCIM/Camera/sub", "Music", "Empty"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -270,24 +271,8 @@ pub mod test_support {
         }
     }
 
-    pub fn rel(path: &str) -> RelPath {
-        RelPath::new(path.split('/')).unwrap()
-    }
-
-    pub fn remote(path: &str) -> DevicePath {
+    pub(crate) fn remote(path: &str) -> DevicePath {
         path.parse().unwrap()
-    }
-
-    pub fn pseudo_random(len: usize) -> Vec<u8> {
-        let mut state: u32 = 0x9E37_79B9;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state & 0xFF) as u8
-            })
-            .collect()
     }
 }
 
@@ -317,14 +302,15 @@ mod tests {
     const LARGE_FILE: usize = 9 * 1024 * 1024;
     /// A single window, so a cancel can only land after the last byte.
     const SMALL_FILE: usize = 1024;
-    /// More windows than the pump can hold buffered plus in flight once the token is set,
-    /// so the stream cannot reach EOF before the cancel is observed.
-    const CANCEL_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
+
+    fn live() -> CancelToken {
+        CancelToken::new()
+    }
 
     async fn open_at(test_name: &str, root: &str) -> (MtpEndpoint, tempfile::TempDir, String) {
         let (storage, dir, serial) = open_device(test_name).await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, &remote(root), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote(root), &serial, &live())
             .await
             .unwrap();
         (endpoint, dir, serial)
@@ -366,7 +352,7 @@ mod tests {
         seed_tree(dir.path());
         for typed in ["/DCIM/Missing", "sd:/DCIM/Missing", "1:/DCIM/Missing"] {
             let root = remote(typed);
-            let err = MtpEndpoint::open(Arc::clone(&storage), &root, &serial)
+            let err = MtpEndpoint::open(Arc::clone(&storage), &root, &serial, &live())
                 .await
                 .unwrap_err();
             let Error::RemotePathNotFound(device_path) = err else {
@@ -382,7 +368,7 @@ mod tests {
         let (storage, dir, serial) = open_device("open-through-file").await;
         seed_tree(dir.path());
         let root = remote("/DCIM/photo.jpg/nested");
-        let err = MtpEndpoint::open(storage, &root, &serial)
+        let err = MtpEndpoint::open(storage, &root, &serial, &live())
             .await
             .unwrap_err();
         let Error::NotADirectory(device_path) = err else {
@@ -412,7 +398,7 @@ mod tests {
     async fn a_file_directly_under_the_storage_root_opens_scans_and_reads() {
         let (storage, dir, serial) = open_device("open-root-file").await;
         fs::write(dir.path().join("photo.jpg"), b"photo").unwrap();
-        let endpoint = MtpEndpoint::open(storage, &remote("/photo.jpg"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/photo.jpg"), &serial, &live())
             .await
             .unwrap();
         assert!(endpoint.is_file());
@@ -432,7 +418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_and_list_of_a_file_endpoint_yield_only_that_file() {
+    async fn scan_of_a_file_endpoint_yields_only_that_file() {
         let (endpoint, _dir, _serial) = open_at("scan-file", "/DCIM/Camera/a.jpg").await;
         let calls = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&calls);
@@ -451,8 +437,63 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(result.snapshot.skipped().is_empty());
         assert!(result.partials.is_empty());
-        let list = endpoint.list(&CancelToken::new()).await.unwrap();
-        assert_eq!(list, result.snapshot);
+    }
+
+    #[tokio::test]
+    async fn scan_of_a_file_endpoint_reports_the_size_as_it_is_now_not_as_opened() {
+        let (endpoint, dir, _serial) = open_at("scan-file-grown", "/DCIM/Camera/a.jpg").await;
+        fs::write(dir.path().join("DCIM/Camera/a.jpg"), b"aaaaaaa").unwrap();
+        let result = endpoint
+            .scan(&CancelToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot.entries()[0].size, 7);
+    }
+
+    #[tokio::test]
+    async fn scan_of_a_file_endpoint_survives_a_rekey_of_its_handle() {
+        let (endpoint, _dir, serial) = open_at("scan-file-rekey", "/DCIM/Camera/a.jpg").await;
+        let (_, rekeyed) =
+            mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM/Camera/a.jpg")).unwrap();
+        let result = endpoint
+            .scan(&CancelToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot.entries()[0].size, 3);
+        assert_eq!(
+            endpoint.resolver.cached(&rel("a.jpg")),
+            Some(mtp_rs::ObjectHandle(u64::from(rekeyed.0)))
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_of_a_file_renamed_after_open_fails_with_source_vanished() {
+        let (endpoint, dir, _serial) = open_at("scan-file-renamed", "/DCIM/Camera/a.jpg").await;
+        fs::rename(
+            dir.path().join("DCIM/Camera/a.jpg"),
+            dir.path().join("DCIM/Camera/renamed.jpg"),
+        )
+        .unwrap();
+        let err = endpoint
+            .scan(&CancelToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SourceVanished(path) if *path == rel("a.jpg")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_of_a_nested_path_honours_a_set_token() {
+        let (storage, dir, serial) = open_device("open-cancelled").await;
+        seed_tree(dir.path());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = MtpEndpoint::open(storage, &remote("/DCIM/Camera"), &serial, &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
     }
 
     #[tokio::test]
@@ -486,8 +527,6 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let err = endpoint.list(&CancelToken::new()).await.unwrap_err();
-        assert!(matches!(err, Error::SourceVanished(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -517,20 +556,23 @@ mod tests {
     async fn read_of_an_empty_file_ends_immediately() {
         let (storage, dir, serial) = open_device("read-empty").await;
         fs::write(dir.path().join("empty.bin"), b"").unwrap();
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &live())
             .await
             .unwrap();
         let chunks = read_all(&endpoint, "empty.bin", 0).await;
         assert!(chunks.is_empty());
     }
 
+    /// The scan primes the handle, so the cancelled read never lists; only the pump sees the
+    /// token, and a file whose every byte already landed is not failed.
     #[tokio::test]
     async fn read_of_an_empty_file_ends_cleanly_even_when_already_cancelled() {
         let (storage, dir, serial) = open_device("read-empty-cancelled").await;
         fs::write(dir.path().join("empty.bin"), b"").unwrap();
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &live())
             .await
             .unwrap();
+        endpoint.scan(&live(), Arc::new(|_| {})).await.unwrap();
         let cancel = CancelToken::new();
         cancel.cancel();
         let items: Vec<_> = endpoint
@@ -547,7 +589,7 @@ mod tests {
         let (storage, dir, serial) = open_device("read-large").await;
         let content = pseudo_random(LARGE_FILE);
         fs::write(dir.path().join("big.bin"), &content).unwrap();
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &live())
             .await
             .unwrap();
         let chunks = read_all(&endpoint, "big.bin", 0).await;
@@ -560,7 +602,7 @@ mod tests {
     async fn read_ends_with_cancelled_once_the_token_is_set_between_windows() {
         let (storage, dir, serial) = open_device("read-cancel").await;
         fs::write(dir.path().join("big.bin"), pseudo_random(CANCEL_FILE)).unwrap();
-        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial, &live())
             .await
             .unwrap();
         let cancel = CancelToken::new();
@@ -581,12 +623,12 @@ mod tests {
     async fn a_cancel_after_the_last_window_ends_the_read_cleanly() {
         let (storage, dir, serial) = open_device("read-cancel-at-eof").await;
         fs::write(dir.path().join("small.bin"), pseudo_random(SMALL_FILE)).unwrap();
-        let endpoint = MtpEndpoint::open(Arc::clone(&storage), &remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(Arc::clone(&storage), &remote("/"), &serial, &live())
             .await
             .unwrap();
         let download = endpoint
             .resolver
-            .with_handle(&rel("small.bin"), |handle| {
+            .with_handle(&rel("small.bin"), &live(), |handle| {
                 storage.download_windowed(handle, ByteRange::From(0), DOWNLOAD_WINDOW)
             })
             .await

@@ -1,6 +1,6 @@
-//! What each conflict policy does with a local file that differs from the phone's copy.
+//! What each conflict policy does with a local file that differs from the phone's copy, and
+//! what every policy does when the two sides disagree on whether a path is a file at all.
 
-#![cfg(feature = "virtual-device")]
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -53,6 +53,39 @@ async fn sync_overwrites_a_differing_local_file_and_keeps_extras() {
     assert_eq!(tree["a.jpg"], PHONE_COPY);
     assert_eq!(tree["local-only.txt"], LOCAL_ONLY);
     assert_eq!(tree.len(), 2, "{tree:?}");
+}
+
+/// The phone has a file `x` where the local directory has a directory `x` with a file in it.
+async fn open_with_kind_conflict() -> VirtualPhone {
+    let phone = VirtualPhone::open("sync-kind-conflict").await;
+    phone.seed(&[("DCIM/Camera/x", PHONE_COPY)]);
+    fs::create_dir(phone.local().join("x")).unwrap();
+    fs::write(phone.local().join("x/keep.txt"), LOCAL_ONLY).unwrap();
+    phone
+}
+
+/// A kind conflict is settled at plan time: no byte streams for a copy that could only fail.
+#[tokio::test]
+async fn sync_skips_a_kind_conflict_before_any_byte_moves_and_keeps_the_local_tree() {
+    let phone = open_with_kind_conflict().await;
+    let pulled = phone.pull(CAMERA, &TransferOptions::sync()).await;
+    let skip = Action::Skip {
+        path: rel("x"),
+        reason: SkipReason::KindConflict,
+    };
+    assert_eq!(pulled.plan.actions(), [skip]);
+    assert_eq!(pulled.plan.summary().bytes_to_copy, 0);
+    assert_eq!((pulled.report.copied, pulled.report.skipped), (0, 1));
+    assert!(
+        pulled.report.failed.is_empty(),
+        "{:?}",
+        pulled.report.failed
+    );
+    let started = |e: &ProgressEvent| matches!(e, ProgressEvent::FileStarted { .. });
+    assert_eq!(count(&pulled.events, started), 0);
+    let tree = phone.local_tree();
+    assert_eq!(tree["x/keep.txt"], LOCAL_ONLY);
+    assert_eq!(tree.len(), 1, "{tree:?}");
 }
 
 #[tokio::test]

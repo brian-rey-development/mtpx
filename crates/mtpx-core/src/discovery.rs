@@ -1,27 +1,32 @@
 //! Plain descriptions of devices and storages, as listed before a session is opened.
 
-use crate::error::{Error, Result};
+use crate::{
+    UsbSpeed,
+    error::{Error, Result},
+};
 use mtp_rs::{MtpDevice, mtp::MtpDeviceInfo};
 
 /// One MTP device visible on the USB bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceSummary {
     /// USB serial number, when the device exposes one.
     pub serial: Option<String>,
     /// Human-readable name built from manufacturer and product strings.
     pub label: String,
-    /// USB vendor id.
+    /// `idVendor` from the USB device descriptor.
     pub vendor_id: u16,
-    /// USB product id.
+    /// `idProduct` from the USB device descriptor.
     pub product_id: u16,
     /// Bus location, stable while the device stays plugged into the same port.
     pub location_id: u64,
     /// Negotiated link speed, when the OS reports it.
-    pub speed: Option<mtp_rs::UsbSpeed>,
+    pub speed: Option<UsbSpeed>,
 }
 
 /// One storage on a device, as reported by `GetStorageInfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StorageSummary {
     /// Position in the device's enumeration order; what `StorageSelector::Index` refers to.
     pub index: usize,
@@ -35,8 +40,9 @@ pub struct StorageSummary {
 
 /// The process holding the device open exclusively, when it can be identified.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExclusiveHolder {
-    /// Process id.
+    /// OS process id of the holder.
     pub pid: u32,
     /// Process name, such as "Android File Transfer".
     pub name: String,
@@ -53,6 +59,15 @@ pub enum DeviceSelector {
     Index(usize),
 }
 
+impl From<&str> for DeviceSelector {
+    /// Digits select by index; anything else is a USB serial.
+    fn from(value: &str) -> Self {
+        value
+            .parse()
+            .map_or_else(|_| Self::Serial(value.to_owned()), Self::Index)
+    }
+}
+
 /// Lists attached MTP devices without opening any of them.
 ///
 /// The order is the one the USB stack reports, so [`DeviceSelector::Index`] is stable within
@@ -61,11 +76,31 @@ pub enum DeviceSelector {
 /// # Errors
 /// `Error::Mtp` when the USB bus cannot be enumerated.
 pub fn list_devices() -> Result<Vec<DeviceSummary>> {
-    let devices = MtpDevice::list_devices().map_err(Error::from_mtp)?;
+    let devices = MtpDevice::list_devices()?;
     Ok(devices.into_iter().map(DeviceSummary::from_mtp).collect())
 }
 
 impl DeviceSummary {
+    /// Describes one attached device; `label` is what a listing shows for it.
+    #[must_use]
+    pub const fn new(
+        serial: Option<String>,
+        label: String,
+        vendor_id: u16,
+        product_id: u16,
+        location_id: u64,
+        speed: Option<UsbSpeed>,
+    ) -> Self {
+        Self {
+            serial,
+            label,
+            vendor_id,
+            product_id,
+            location_id,
+            speed,
+        }
+    }
+
     pub(crate) fn from_mtp(info: MtpDeviceInfo) -> Self {
         let label = device_label(
             info.manufacturer.as_deref(),
@@ -73,13 +108,37 @@ impl DeviceSummary {
             info.vendor_id,
             info.product_id,
         );
-        Self {
-            serial: info.serial_number,
+        Self::new(
+            info.serial_number,
             label,
-            vendor_id: info.vendor_id,
-            product_id: info.product_id,
-            location_id: info.location_id,
-            speed: info.speed,
+            info.vendor_id,
+            info.product_id,
+            info.location_id,
+            info.speed,
+        )
+    }
+}
+
+impl StorageSummary {
+    /// Describes one storage; `index` is its position in the device's enumeration order.
+    #[must_use]
+    pub const fn new(index: usize, name: String, free: u64, total: u64) -> Self {
+        Self {
+            index,
+            name,
+            free,
+            total,
+        }
+    }
+}
+
+impl ExclusiveHolder {
+    /// Names the process that holds the device.
+    #[must_use]
+    pub fn new(pid: u32, name: impl Into<String>) -> Self {
+        Self {
+            pid,
+            name: name.into(),
         }
     }
 }
@@ -87,27 +146,43 @@ impl DeviceSummary {
 /// Picks the device `selector` names out of a listing.
 ///
 /// # Errors
-/// `NoDevice` when nothing matches, `AmbiguousDevice` when `Only` finds several.
-pub fn select_device(
-    devices: Vec<DeviceSummary>,
+/// `NoDevice` when nothing is attached, `DeviceNotFound` when `selector` matches none of the
+/// attached devices, `AmbiguousDevice` when `Only` finds several.
+pub(crate) fn select_device(
+    mut devices: Vec<DeviceSummary>,
     selector: &DeviceSelector,
 ) -> Result<DeviceSummary> {
-    match selector {
-        DeviceSelector::Only => select_only(devices),
-        DeviceSelector::Serial(serial) => devices
-            .into_iter()
-            .find(|device| device.serial.as_deref() == Some(serial))
-            .ok_or(Error::NoDevice),
-        DeviceSelector::Index(index) => devices.into_iter().nth(*index).ok_or(Error::NoDevice),
+    if devices.is_empty() {
+        return Err(Error::NoDevice);
+    }
+    let (position, wanted) = match selector {
+        DeviceSelector::Only => return select_only(devices),
+        DeviceSelector::Serial(serial) => (position_of_serial(&devices, serial), serial.clone()),
+        DeviceSelector::Index(index) => (
+            (*index < devices.len()).then_some(*index),
+            index.to_string(),
+        ),
+    };
+    match position {
+        Some(position) => Ok(devices.swap_remove(position)),
+        None => Err(Error::DeviceNotFound {
+            selector: wanted,
+            available: devices,
+        }),
     }
 }
 
+fn position_of_serial(devices: &[DeviceSummary], serial: &str) -> Option<usize> {
+    devices
+        .iter()
+        .position(|device| device.serial.as_deref() == Some(serial))
+}
+
 fn select_only(mut devices: Vec<DeviceSummary>) -> Result<DeviceSummary> {
-    match devices.len() {
-        0 => Err(Error::NoDevice),
-        1 => Ok(devices.remove(0)),
-        _ => Err(Error::AmbiguousDevice(devices)),
+    if devices.len() == 1 {
+        return Ok(devices.remove(0));
     }
+    Err(Error::AmbiguousDevice(devices))
 }
 
 /// The USB manufacturer and product strings joined, or `vvvv:pppp` when the device reports neither.
@@ -139,14 +214,14 @@ mod tests {
     const PRODUCT: u16 = 0x4ee1;
 
     fn summary(serial: Option<&str>) -> DeviceSummary {
-        DeviceSummary {
-            serial: serial.map(str::to_owned),
-            label: "Google Pixel".into(),
-            vendor_id: VENDOR,
-            product_id: PRODUCT,
-            location_id: 7,
-            speed: None,
-        }
+        DeviceSummary::new(
+            serial.map(str::to_owned),
+            "Google Pixel".into(),
+            VENDOR,
+            PRODUCT,
+            7,
+            None,
+        )
     }
 
     #[test]
@@ -180,15 +255,45 @@ mod tests {
     }
 
     #[test]
-    fn serial_and_index_pick_one_device_or_report_none() {
+    fn serial_and_index_pick_one_device() {
         let devices = vec![summary(None), summary(Some("B"))];
         let by_serial =
             select_device(devices.clone(), &DeviceSelector::Serial("B".into())).unwrap();
         assert_eq!(by_serial.serial.as_deref(), Some("B"));
-        let by_index = select_device(devices.clone(), &DeviceSelector::Index(0)).unwrap();
+        let by_index = select_device(devices, &DeviceSelector::Index(0)).unwrap();
         assert_eq!(by_index.serial, None);
-        for selector in [DeviceSelector::Serial("C".into()), DeviceSelector::Index(2)] {
+    }
+
+    #[test]
+    fn a_selector_matching_no_attached_device_lists_what_is_attached() {
+        let devices = vec![summary(None), summary(Some("B"))];
+        let cases = [
+            (DeviceSelector::Serial("C".into()), "C"),
+            (DeviceSelector::Index(2), "2"),
+        ];
+        for (selector, shown) in cases {
             let err = select_device(devices.clone(), &selector).unwrap_err();
+            let Error::DeviceNotFound {
+                selector: named,
+                available,
+            } = err
+            else {
+                panic!("{selector:?}: {err:?}");
+            };
+            assert_eq!(named, shown);
+            assert_eq!(available, devices);
+        }
+    }
+
+    #[test]
+    fn an_empty_bus_is_no_device_whatever_the_selector() {
+        let selectors = [
+            DeviceSelector::Only,
+            DeviceSelector::Serial("A".into()),
+            DeviceSelector::Index(0),
+        ];
+        for selector in selectors {
+            let err = select_device(vec![], &selector).unwrap_err();
             assert!(matches!(err, Error::NoDevice), "{selector:?}: {err:?}");
         }
     }

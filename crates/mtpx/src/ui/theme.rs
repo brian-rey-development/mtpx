@@ -1,12 +1,6 @@
 //! Colors for stderr output, all of which collapse to plain text when color is off.
 
 use console::Style;
-use std::{env, io::IsTerminal};
-
-/// Whether styled output is wanted; decided once from the flag, `NO_COLOR` and the terminal.
-pub fn color_enabled(no_color: bool) -> bool {
-    !no_color && env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
-}
 
 /// Paints text for stderr, or leaves it alone when color is off.
 #[derive(Debug, Clone, Copy)]
@@ -15,7 +9,6 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// A theme that paints only when `color` is set.
     pub const fn new(color: bool) -> Self {
         Self { color }
     }
@@ -45,8 +38,7 @@ impl Theme {
         self.paint(Style::new().bold(), text)
     }
 
-    // Forced styling bypasses console's own stdout-based detection; the decision was made from
-    // stderr in `color_enabled`.
+    // Forced styling: console detects stdout, but the decision came from stderr.
     fn paint(self, style: Style, text: &str) -> String {
         if !self.color {
             return text.to_owned();

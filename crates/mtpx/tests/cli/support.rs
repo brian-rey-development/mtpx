@@ -15,6 +15,7 @@ pub const USAGE_ERROR: i32 = 2;
 pub const NOT_FOUND: i32 = 5;
 pub const TRANSFER_FAILED: i32 = 6;
 pub const CONFLICTS: i32 = 7;
+pub const INTERRUPTED: i32 = 130;
 
 /// A virtual phone backed by a temp dir, plus an empty local directory to pull into.
 pub struct Phone {
@@ -48,17 +49,18 @@ impl Phone {
         self.local.path()
     }
 
+    /// The directory the virtual device serves; what `seed` writes into.
+    pub fn backing(&self) -> &Path {
+        self.backing.path()
+    }
+
     pub fn local_str(&self) -> &str {
         self.local().to_str().unwrap()
     }
 
     /// `mtpx --virtual <backing> --no-color`, ready for a subcommand.
     pub fn mtpx(&self) -> Command {
-        let mut cmd = Command::cargo_bin("mtpx").unwrap();
-        cmd.arg("--virtual")
-            .arg(self.backing.path())
-            .arg("--no-color");
-        cmd
+        Command::from_std(self.mtpx_process())
     }
 
     /// The same invocation as a plain process, for tests that drive the pipes themselves.

@@ -5,7 +5,7 @@ use crate::{
     internal::mtp::scan::list_folder,
     path::RelPath,
 };
-use mtp_rs::{ObjectHandle, Storage};
+use mtp_rs::{CancelToken, ObjectHandle, Storage};
 use std::{
     collections::HashMap,
     future::Future,
@@ -25,13 +25,17 @@ impl HandleCache {
         self.0.extend(entries);
     }
 
+    fn remove(&mut self, path: &RelPath) {
+        self.0.remove(path);
+    }
+
     fn clear(&mut self) {
         self.0.clear();
     }
 }
 
 /// Resolves paths under one root to object handles, listing directories only when the cache misses.
-pub struct Resolver {
+pub(crate) struct Resolver {
     storage: Arc<Storage>,
     root: Option<ObjectHandle>,
     cache: Mutex<HandleCache>,
@@ -39,7 +43,7 @@ pub struct Resolver {
 
 impl Resolver {
     /// Starts with an empty cache; `root` is `None` for the storage root.
-    pub fn new(storage: Arc<Storage>, root: Option<ObjectHandle>) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>, root: Option<ObjectHandle>) -> Self {
         Self {
             storage,
             root,
@@ -49,36 +53,48 @@ impl Resolver {
 
     /// The transfer root as a listing parent; `None` is the storage root.
     #[must_use]
-    pub const fn root(&self) -> Option<ObjectHandle> {
+    pub(crate) const fn root(&self) -> Option<ObjectHandle> {
         self.root
     }
 
     /// Records handles a scan already learned so later lookups need no listing.
-    pub fn prime(&self, entries: impl IntoIterator<Item = (RelPath, ObjectHandle)>) {
+    pub(crate) fn prime(&self, entries: impl IntoIterator<Item = (RelPath, ObjectHandle)>) {
         self.lock().prime(entries);
     }
 
     /// The handle for `path`, listing its ancestors as needed.
     ///
     /// # Errors
-    /// `SourceVanished` when a segment is missing on the device, or a listing error.
-    pub async fn resolve(&self, path: &RelPath) -> Result<ObjectHandle> {
+    /// `SourceVanished` when a segment is missing on the device, `Cancelled` once the token
+    /// is set, or a listing error.
+    pub(crate) async fn resolve(
+        &self,
+        path: &RelPath,
+        cancel: &CancelToken,
+    ) -> Result<ObjectHandle> {
+        if let Some(handle) = self.cached(path) {
+            return Ok(handle);
+        }
         let Some(parent) = path.parent() else {
             return self
                 .root
                 .ok_or(Error::Unsupported("object operations on the storage root"));
         };
-        let parent_handle = self.listing_parent(&parent).await?;
-        self.child(parent_handle, &parent, path).await
+        let parent_handle = self.listing_parent(&parent, cancel).await?;
+        self.child(parent_handle, &parent, path, cancel).await
     }
 
     /// The handle to list `dir` under, walking down from the root; `None` is the storage root.
-    async fn listing_parent(&self, dir: &RelPath) -> Result<Option<ObjectHandle>> {
+    async fn listing_parent(
+        &self,
+        dir: &RelPath,
+        cancel: &CancelToken,
+    ) -> Result<Option<ObjectHandle>> {
         let mut handle = self.root;
         let mut current = RelPath::root();
         for segment in dir.segments() {
             let next = current.join(segment)?;
-            handle = Some(self.child(handle, &current, &next).await?);
+            handle = Some(self.child(handle, &current, &next, cancel).await?);
             current = next;
         }
         Ok(handle)
@@ -90,54 +106,87 @@ impl Resolver {
         parent_handle: Option<ObjectHandle>,
         parent: &RelPath,
         path: &RelPath,
+        cancel: &CancelToken,
     ) -> Result<ObjectHandle> {
         if let Some(handle) = self.cached(path) {
             return Ok(handle);
         }
-        let listing = list_folder(&self.storage, parent_handle, parent, None).await?;
+        let listing = list_folder(&self.storage, parent_handle, parent, Some(cancel)).await?;
         let children = listing
             .children
-            .iter()
-            .map(|(p, info)| (p.clone(), info.handle));
+            .into_iter()
+            .map(|(p, info)| (p, info.handle));
         self.lock().prime(children);
         self.cached(path)
             .ok_or_else(|| Error::SourceVanished(path.clone()))
     }
 
-    /// Runs `op` on the resolved handle; a stale handle anywhere in the sequence rebuilds the
-    /// cache from scratch and retries the whole sequence once.
+    /// Runs `op` on the resolved handle. A stale handle re-lists its parent and retries once;
+    /// a parent that went stale as well rebuilds the whole cache and retries once more.
     ///
     /// # Errors
-    /// Whatever `op` or the resolution returns, lifted through `Error::from_mtp`.
-    pub async fn with_handle<T, F, Fut>(&self, path: &RelPath, op: F) -> Result<T>
+    /// Whatever `op` or the resolution returns, lifted through `From<mtp_rs::Error>`.
+    pub(crate) async fn with_handle<T, F, Fut>(
+        &self,
+        path: &RelPath,
+        cancel: &CancelToken,
+        op: F,
+    ) -> Result<T>
     where
         T: Send,
         F: Fn(ObjectHandle) -> Fut + Send + Sync,
         Fut: Future<Output = std::result::Result<T, mtp_rs::Error>> + Send,
     {
-        match self.attempt(path, &op).await {
-            Err(e) if e.is_stale_handle() => {
-                // A media rescan re-keys every object on the device, so nothing cached survives it.
-                self.lock().clear();
-                self.attempt(path, &op).await
-            }
+        match self.attempt(path, cancel, &op).await {
+            Err(e) if e.is_stale_handle() => self.recover(path, cancel, &op).await,
             outcome => outcome,
         }
     }
 
-    async fn attempt<T, F, Fut>(&self, path: &RelPath, op: &F) -> Result<T>
+    // One stale object is usually a deletion or a single re-key; only a stale parent means a
+    // media rescan re-keyed the tree, so the cache is not thrown away on the first miss.
+    async fn recover<T, F, Fut>(&self, path: &RelPath, cancel: &CancelToken, op: &F) -> Result<T>
     where
         T: Send,
         F: Fn(ObjectHandle) -> Fut + Send + Sync,
         Fut: Future<Output = std::result::Result<T, mtp_rs::Error>> + Send,
     {
-        let handle = self.resolve(path).await?;
-        op(handle).await.map_err(Error::from_mtp)
+        self.lock().remove(path);
+        let outcome = self.attempt(path, cancel, op).await;
+        let rekeyed = match &outcome {
+            Err(e) if e.is_stale_handle() => true,
+            Err(Error::SourceVanished(_)) => self.parent_is_stale(path).await,
+            _ => false,
+        };
+        if !rekeyed {
+            return outcome;
+        }
+        self.lock().clear();
+        self.attempt(path, cancel, op).await
+    }
+
+    /// Whether the cached handle of `path`'s parent no longer answers; the storage root is
+    /// never cached and never stale, so a miss directly under it is a genuine disappearance.
+    async fn parent_is_stale(&self, path: &RelPath) -> bool {
+        let Some(handle) = path.parent().and_then(|parent| self.cached(&parent)) else {
+            return false;
+        };
+        matches!(self.storage.get_object_info(handle).await, Err(e) if e.is_stale_handle())
+    }
+
+    async fn attempt<T, F, Fut>(&self, path: &RelPath, cancel: &CancelToken, op: &F) -> Result<T>
+    where
+        T: Send,
+        F: Fn(ObjectHandle) -> Fut + Send + Sync,
+        Fut: Future<Output = std::result::Result<T, mtp_rs::Error>> + Send,
+    {
+        let handle = self.resolve(path, cancel).await?;
+        op(handle).await.map_err(Error::from)
     }
 
     /// The handle the cache holds for `path`, without touching the device.
     #[must_use]
-    pub fn cached(&self, path: &RelPath) -> Option<ObjectHandle> {
+    pub(crate) fn cached(&self, path: &RelPath) -> Option<ObjectHandle> {
         self.lock().get(path)
     }
 
@@ -152,12 +201,8 @@ mod cache_tests {
     #![allow(clippy::unwrap_used)]
 
     use super::HandleCache;
-    use crate::path::RelPath;
+    use crate::test_support::rel;
     use mtp_rs::ObjectHandle;
-
-    fn rel(path: &str) -> RelPath {
-        RelPath::new(path.split('/')).unwrap()
-    }
 
     fn primed() -> HandleCache {
         let mut cache = HandleCache::default();
@@ -180,6 +225,15 @@ mod cache_tests {
     }
 
     #[test]
+    fn remove_forgets_one_handle_and_leaves_the_rest() {
+        let mut cache = primed();
+        cache.remove(&rel("DCIM/Camera/a.jpg"));
+        assert_eq!(cache.get(&rel("DCIM/Camera/a.jpg")), None);
+        assert_eq!(cache.get(&rel("DCIM/Camera")), Some(ObjectHandle(2)));
+        assert_eq!(cache.0.len(), 4);
+    }
+
+    #[test]
     fn prime_overwrites_an_existing_handle() {
         let mut cache = primed();
         cache.prime([(rel("DCIM"), ObjectHandle(9))]);
@@ -197,7 +251,7 @@ mod tests {
         internal::mtp::test_support::{open_device, rel, seed_tree},
         path::RelPath,
     };
-    use mtp_rs::ObjectHandle;
+    use mtp_rs::{CancelToken, ObjectHandle};
     use std::{
         fs,
         path::Path,
@@ -207,12 +261,19 @@ mod tests {
         },
     };
 
+    fn live() -> CancelToken {
+        CancelToken::new()
+    }
+
     #[tokio::test]
     async fn resolve_lists_ancestors_on_a_cold_cache_and_caches_siblings() {
         let (storage, dir, _serial) = open_device("resolver-cold").await;
         seed_tree(dir.path());
         let resolver = Resolver::new(storage, None);
-        let handle = resolver.resolve(&rel("DCIM/Camera/a.jpg")).await.unwrap();
+        let handle = resolver
+            .resolve(&rel("DCIM/Camera/a.jpg"), &live())
+            .await
+            .unwrap();
         assert_ne!(handle, ObjectHandle::ROOT);
         assert!(resolver.cached(&rel("DCIM")).is_some());
         assert!(resolver.cached(&rel("DCIM/Camera")).is_some());
@@ -222,20 +283,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_primed_leaf_resolves_without_listing_its_ancestors() {
+        let (storage, dir, _serial) = open_device("resolver-primed").await;
+        seed_tree(dir.path());
+        let resolver = Resolver::new(storage, None);
+        let path = rel("DCIM/Camera/a.jpg");
+        resolver.prime([(path.clone(), ObjectHandle(42))]);
+        assert_eq!(
+            resolver.resolve(&path, &live()).await.unwrap(),
+            ObjectHandle(42)
+        );
+        assert!(resolver.cached(&rel("DCIM")).is_none());
+    }
+
+    #[tokio::test]
     async fn resolve_of_a_missing_path_is_source_vanished() {
         let (storage, dir, _serial) = open_device("resolver-missing").await;
         seed_tree(dir.path());
         let resolver = Resolver::new(storage, None);
-        let err = resolver.resolve(&rel("DCIM/nope.jpg")).await.unwrap_err();
+        let err = resolver
+            .resolve(&rel("DCIM/nope.jpg"), &live())
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, Error::SourceVanished(path) if *path == rel("DCIM/nope.jpg")),
             "{err:?}"
         );
-        let err = resolver.resolve(&rel("Nope/deeper.jpg")).await.unwrap_err();
+        let err = resolver
+            .resolve(&rel("Nope/deeper.jpg"), &live())
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, Error::SourceVanished(path) if *path == rel("Nope")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_on_a_cold_cache_honours_a_set_token() {
+        let (storage, dir, _serial) = open_device("resolver-cancel").await;
+        seed_tree(dir.path());
+        let resolver = Resolver::new(Arc::clone(&storage), None);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = resolver
+            .with_handle(&rel("DCIM/Camera/a.jpg"), &cancel, |handle| {
+                storage.get_object_info(handle)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolving_the_storage_root_is_unsupported_but_a_folder_root_resolves_to_itself() {
+        let (storage, dir, _serial) = open_device("resolver-root").await;
+        seed_tree(dir.path());
+        let cold = Resolver::new(Arc::clone(&storage), None);
+        let err = cold.resolve(&RelPath::root(), &live()).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let dcim = cold.resolve(&rel("DCIM"), &live()).await.unwrap();
+        let rooted = Resolver::new(storage, Some(dcim));
+        assert_eq!(
+            rooted.resolve(&RelPath::root(), &live()).await.unwrap(),
+            dcim
+        );
+        assert!(rooted.cached(&RelPath::root()).is_none());
     }
 
     #[tokio::test]
@@ -244,12 +357,12 @@ mod tests {
         seed_tree(dir.path());
         let resolver = Resolver::new(Arc::clone(&storage), None);
         let path = rel("DCIM/Camera/a.jpg");
-        let old = resolver.resolve(&path).await.unwrap();
+        let old = resolver.resolve(&path, &live()).await.unwrap();
         let (_, rekeyed) =
             mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM/Camera/a.jpg")).unwrap();
         let calls = AtomicUsize::new(0);
         let info = resolver
-            .with_handle(&path, |handle| {
+            .with_handle(&path, &live(), |handle| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 storage.get_object_info(handle)
             })
@@ -260,6 +373,10 @@ mod tests {
         assert_ne!(info.handle, old);
         assert_eq!(info.handle.0, u64::from(rekeyed.0));
         assert_eq!(resolver.cached(&path), Some(info.handle));
+        assert!(
+            resolver.cached(&rel("Music")).is_some(),
+            "one stale handle does not throw the rest of the cache away"
+        );
     }
 
     #[tokio::test]
@@ -268,13 +385,13 @@ mod tests {
         seed_tree(dir.path());
         let resolver = Resolver::new(Arc::clone(&storage), None);
         let path = rel("DCIM/Camera/a.jpg");
-        resolver.resolve(&path).await.unwrap();
+        resolver.resolve(&path, &live()).await.unwrap();
         mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM")).unwrap();
         let (_, rekeyed) =
             mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM/Camera/a.jpg")).unwrap();
         let calls = AtomicUsize::new(0);
         let info = resolver
-            .with_handle(&path, |handle| {
+            .with_handle(&path, &live(), |handle| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 storage.get_object_info(handle)
             })
@@ -286,16 +403,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_handle_rebuilds_the_cache_when_the_parent_itself_was_rekeyed() {
+        let (storage, dir, serial) = open_device("resolver-rekey-parent").await;
+        seed_tree(dir.path());
+        let resolver = Resolver::new(Arc::clone(&storage), None);
+        let path = rel("DCIM/Camera/a.jpg");
+        resolver.resolve(&path, &live()).await.unwrap();
+        mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM/Camera")).unwrap();
+        let (_, rekeyed) =
+            mtp_rs::rekey_virtual_object(&serial, Path::new("DCIM/Camera/a.jpg")).unwrap();
+        let calls = AtomicUsize::new(0);
+        let info = resolver
+            .with_handle(&path, &live(), |handle| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                storage.get_object_info(handle)
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(info.handle.0, u64::from(rekeyed.0));
+        assert_eq!(resolver.cached(&path), Some(info.handle));
+        assert_eq!(
+            resolver.cached(&rel("DCIM/Camera")),
+            Some(info.parent),
+            "the re-keyed parent is cached afresh"
+        );
+    }
+
+    #[tokio::test]
     async fn with_handle_on_a_file_deleted_behind_the_cache_is_source_vanished() {
         let (storage, dir, _serial) = open_device("resolver-deleted").await;
         seed_tree(dir.path());
         let resolver = Resolver::new(Arc::clone(&storage), None);
         let path = rel("DCIM/Camera/a.jpg");
-        resolver.resolve(&path).await.unwrap();
+        resolver.resolve(&path, &live()).await.unwrap();
         fs::remove_file(dir.path().join("DCIM/Camera/a.jpg")).unwrap();
         let calls = AtomicUsize::new(0);
         let err = resolver
-            .with_handle(&path, |handle| {
+            .with_handle(&path, &live(), |handle| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 storage.get_object_info(handle)
             })
@@ -307,6 +452,11 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(resolver.cached(&path), None);
+        assert!(
+            resolver.cached(&rel("Music")).is_some(),
+            "other folders survive a deletion"
+        );
+        assert!(resolver.cached(&rel("DCIM/Camera")).is_some());
     }
 
     #[tokio::test]
@@ -316,7 +466,7 @@ mod tests {
         let resolver = Resolver::new(storage, None);
         let calls = AtomicUsize::new(0);
         let err = resolver
-            .with_handle(&rel("Music/c.mp3"), |_| {
+            .with_handle(&rel("Music/c.mp3"), &live(), |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Err::<(), _>(mtp_rs::Error::Busy))
             })
@@ -331,12 +481,17 @@ mod tests {
         let (storage, dir, _serial) = open_device("resolver-subroot").await;
         seed_tree(dir.path());
         let cold = Resolver::new(Arc::clone(&storage), None);
-        let dcim = cold.resolve(&rel("DCIM")).await.unwrap();
+        let dcim = cold.resolve(&rel("DCIM"), &live()).await.unwrap();
         let resolver = Resolver::new(storage, Some(dcim));
-        let handle = resolver.resolve(&rel("Camera/a.jpg")).await.unwrap();
+        let handle = resolver
+            .resolve(&rel("Camera/a.jpg"), &live())
+            .await
+            .unwrap();
         assert_eq!(
             handle,
-            cold.resolve(&rel("DCIM/Camera/a.jpg")).await.unwrap()
+            cold.resolve(&rel("DCIM/Camera/a.jpg"), &live())
+                .await
+                .unwrap()
         );
         assert!(resolver.cached(&RelPath::root()).is_none());
     }
