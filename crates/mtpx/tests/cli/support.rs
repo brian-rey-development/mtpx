@@ -15,6 +15,7 @@ pub const USAGE_ERROR: i32 = 2;
 pub const NOT_FOUND: i32 = 5;
 pub const TRANSFER_FAILED: i32 = 6;
 pub const CONFLICTS: i32 = 7;
+#[cfg(unix)]
 pub const INTERRUPTED: i32 = 130;
 
 /// A virtual phone backed by a temp dir, plus an empty local directory to pull into.
@@ -50,6 +51,7 @@ impl Phone {
     }
 
     /// The directory the virtual device serves; what `seed` writes into.
+    #[cfg(unix)]
     pub fn backing(&self) -> &Path {
         self.backing.path()
     }

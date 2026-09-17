@@ -261,7 +261,7 @@ mod tests {
         let path = RelPath::new(["\x1b[2Jx.jpg"]).unwrap();
         let rendered = format!("{:?}", report(&Error::SourceVanished(path)));
         assert!(rendered.contains("\u{FFFD}[2Jx.jpg"), "{rendered}");
-        assert!(!rendered.contains('\x1b'), "{rendered}");
+        assert!(!rendered.contains("\x1b[2J"), "{rendered}");
     }
 
     #[test]

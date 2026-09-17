@@ -1,14 +1,14 @@
 //! `mtpx pull` and `mtpx sync`: the plan, the copies, the conflict policies and the summary.
 
 use crate::support::{
-    A_JPG, A_JPG_SIZE, B_JPG, B_JPG_SIZE, BOTH_SIZE, CONFLICTING_LOCAL, CONFLICTS, INTERRUPTED,
-    NOT_FOUND, Phone, TRANSFER_FAILED, only_line_starting_with,
+    A_JPG, A_JPG_SIZE, B_JPG, B_JPG_SIZE, BOTH_SIZE, CONFLICTING_LOCAL, CONFLICTS, NOT_FOUND,
+    Phone, TRANSFER_FAILED, only_line_starting_with,
 };
 use predicates::prelude::*;
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
-    process::{self, Child, Stdio},
+    io::{BufRead, BufReader},
+    process::{Child, Stdio},
 };
 
 /// A name that would retitle or clear a terminal if printed raw.
@@ -378,91 +378,116 @@ fn pull_resumes_a_valid_partial_and_removes_the_part_files() {
     assert_eq!(phone.local_names(), ["a.jpg"]);
 }
 
-/// Big enough that the signal lands while bytes are still moving: the virtual device streams
-/// hundreds of MiB per second, and nothing here waits on a clock.
-const BIG_FILE: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
+mod interrupt {
+    use crate::support::{INTERRUPTED, Phone};
+    use predicates::prelude::*;
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Read},
+        process::{self, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
 
-/// Reads stderr lines until one starts with `prefix`, or the pipe ends.
-fn read_until_line_starting_with(stderr: &mut impl BufRead, prefix: &str) -> String {
-    let mut line = String::new();
-    while stderr.read_line(&mut line).unwrap() > 0 && !line.starts_with(prefix) {
-        line.clear();
+    /// Big enough that the signal lands while bytes are still moving: the virtual device
+    /// streams hundreds of MiB per second, and nothing here waits on a clock.
+    const BIG_FILE: u64 = 256 * 1024 * 1024;
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    const FIRST_WINDOW_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn read_until_line_starting_with(stderr: &mut impl BufRead, prefix: &str) -> String {
+        let mut line = String::new();
+        while stderr.read_line(&mut line).unwrap() > 0 && !line.starts_with(prefix) {
+            line.clear();
+        }
+        line
     }
-    line
-}
 
-/// Starts pulling `big.bin`, sends SIGINT once the copy is under way, and returns the rest of
-/// stderr with the exit code.
-#[cfg(unix)]
-fn interrupt_a_big_pull(phone: &Phone) -> (Option<i32>, String) {
-    let mut child = phone
-        .mtpx_process()
-        .args(["pull", "/DCIM/Camera", phone.local_str()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap());
-    let copying = read_until_line_starting_with(&mut stderr, "copying ");
-    assert!(copying.starts_with("copying big.bin ("), "{copying}");
-    let sent = process::Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(sent.success());
-    let mut rest = String::new();
-    stderr.read_to_string(&mut rest).unwrap();
-    (child.wait().unwrap().code(), rest)
-}
+    /// The `copying` line precedes the first write, so the signal must wait for bytes on disk
+    /// or it can land before anything resumable exists.
+    fn wait_for_first_window(part: &std::path::Path) {
+        let deadline = Instant::now() + FIRST_WINDOW_TIMEOUT;
+        while fs::metadata(part).map_or(0, |m| m.len()) < WINDOW {
+            assert!(
+                Instant::now() < deadline,
+                "no window landed in {}",
+                part.display()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
-/// A phone with one sparse `big.bin` under the camera directory.
-fn phone_with_a_big_file() -> Phone {
-    let phone = Phone::empty();
-    let big = phone.backing().join("DCIM/Camera/big.bin");
-    fs::create_dir_all(big.parent().unwrap()).unwrap();
-    fs::File::create(&big).unwrap().set_len(BIG_FILE).unwrap();
-    phone
-}
+    /// Starts pulling `big.bin`, sends SIGINT once the first window is on disk, and returns
+    /// the rest of stderr with the exit code.
+    fn interrupt_a_big_pull(phone: &Phone) -> (Option<i32>, String) {
+        let mut child = phone
+            .mtpx_process()
+            .args(["pull", "/DCIM/Camera", phone.local_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let copying = read_until_line_starting_with(&mut stderr, "copying ");
+        assert!(copying.starts_with("copying big.bin ("), "{copying}");
+        wait_for_first_window(&phone.local().join("big.bin.mtpx-part"));
+        let sent = process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let mut rest = String::new();
+        stderr.read_to_string(&mut rest).unwrap();
+        (child.wait().unwrap().code(), rest)
+    }
 
-#[cfg(unix)]
-#[test]
-fn ctrl_c_mid_transfer_exits_130_and_keeps_the_partial() {
-    let phone = phone_with_a_big_file();
-    let (code, rest) = interrupt_a_big_pull(&phone);
-    assert_eq!(code, Some(INTERRUPTED), "{rest}");
-    assert!(
-        rest.contains("interrupting, finishing the current window...\n"),
-        "{rest}"
-    );
-    assert!(rest.contains("Interrupted after "), "{rest}");
-    assert!(
-        rest.contains(" 0 copied, 1 remaining, re-run to resume\n"),
-        "{rest}"
-    );
-    assert_eq!(
-        phone.local_names(),
-        ["big.bin.mtpx-part", "big.bin.mtpx-part.json"]
-    );
-}
+    fn phone_with_a_big_file() -> Phone {
+        let phone = Phone::empty();
+        let big = phone.backing().join("DCIM/Camera/big.bin");
+        fs::create_dir_all(big.parent().unwrap()).unwrap();
+        fs::File::create(&big).unwrap().set_len(BIG_FILE).unwrap();
+        phone
+    }
 
-#[cfg(unix)]
-#[test]
-fn the_run_after_a_ctrl_c_resumes_the_partial_and_completes_the_file() {
-    let phone = phone_with_a_big_file();
-    let (code, rest) = interrupt_a_big_pull(&phone);
-    assert_eq!(code, Some(INTERRUPTED), "{rest}");
-    phone
-        .mtpx()
-        .args(["pull", "/DCIM/Camera", phone.local_str()])
-        .assert()
-        .code(0)
-        .stderr(
-            predicate::str::contains(" resumable), skip 0\n")
-                .and(predicate::str::contains("resuming big.bin from ")),
+    #[test]
+    fn ctrl_c_mid_transfer_exits_130_and_keeps_the_partial() {
+        let phone = phone_with_a_big_file();
+        let (code, rest) = interrupt_a_big_pull(&phone);
+        assert_eq!(code, Some(INTERRUPTED), "{rest}");
+        assert!(
+            rest.contains("interrupting, finishing the current window...\n"),
+            "{rest}"
         );
-    assert_eq!(
-        fs::metadata(phone.local().join("big.bin")).unwrap().len(),
-        BIG_FILE
-    );
-    assert_eq!(phone.local_names(), ["big.bin"]);
+        assert!(rest.contains("Interrupted after "), "{rest}");
+        assert!(
+            rest.contains(" 0 copied, 1 remaining, re-run to resume\n"),
+            "{rest}"
+        );
+        assert_eq!(
+            phone.local_names(),
+            ["big.bin.mtpx-part", "big.bin.mtpx-part.json"]
+        );
+    }
+
+    #[test]
+    fn the_run_after_a_ctrl_c_resumes_the_partial_and_completes_the_file() {
+        let phone = phone_with_a_big_file();
+        let (code, rest) = interrupt_a_big_pull(&phone);
+        assert_eq!(code, Some(INTERRUPTED), "{rest}");
+        phone
+            .mtpx()
+            .args(["pull", "/DCIM/Camera", phone.local_str()])
+            .assert()
+            .code(0)
+            .stderr(
+                predicate::str::contains(" resumable), skip 0\n")
+                    .and(predicate::str::contains("resuming big.bin from ")),
+            );
+        assert_eq!(
+            fs::metadata(phone.local().join("big.bin")).unwrap().len(),
+            BIG_FILE
+        );
+        assert_eq!(phone.local_names(), ["big.bin"]);
+    }
 }

@@ -297,6 +297,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
     use super::super::test_support::{endpoint, identity, rel, scan, write_valid_partial};
+    #[cfg(unix)]
+    use crate::path::{PathError, RelPath};
     use crate::{
         entry::{EntryKind, Snapshot},
         error::Error,
@@ -305,7 +307,6 @@ mod tests {
             local::LocalEndpoint,
             partial::{Fingerprint, SIDECAR_TMP_SUFFIX, Sidecar, part_path, sidecar_path},
         },
-        path::{PathError, RelPath},
     };
     use mtp_rs::CancelToken;
     use std::{
@@ -330,6 +331,7 @@ mod tests {
 
     /// Whether a file made unreadable with mode 000 actually refuses reads, which it does not
     /// for root.
+    #[cfg(unix)]
     fn unreadable(path: &std::path::Path) -> bool {
         fs::read(path).is_err()
     }
