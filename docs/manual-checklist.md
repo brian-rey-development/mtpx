@@ -119,4 +119,17 @@ Eight fixes came out of this run, labelled A to H in the table:
 - G. A dry run listed every identical file as a `skip` line.
 - H. Ctrl-C during the scan printed a bare `cancelled`.
 
+Verified after the fixes, same phone: `ls /Nope` shows `/Nope` and `mtpx ls /`; `ls | head`
+exits quietly; a synced dry run prints nothing on stdout; a 9 MB photo interrupted at two
+windows planned `8.4 MB resumable` and resumed byte-exact; the summary reads
+`Interrupted after 49s` for a 49 s command.
+
+Two observations for M2, not defects:
+
+- Listing latency is the phone's: 6,736 USB transfers for 2,214 objects (three per object,
+  no retries), 9 s right after unlocking and 39 s later. Bulk metadata
+  (`GetObjectPropList`) where the device supports it would cut this.
+- A single-file pull lists the parent folder twice (locate, then scan); with a slow phone
+  that doubled a 665 kB resume to 1m 17s. The locate listing could prime the scan.
+
 Still to run by hand: 1.3 and 4.4/4.5 (cable), 3.6 (new photo).

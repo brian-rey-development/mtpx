@@ -398,7 +398,7 @@ pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
 `LocalEndpoint`: `std::fs` inside `spawn_blocking`, `BufWriter` 1 MiB, writes to `.mtpx-part`, sidecar written before the first byte and updated on `abort`, `finish` verifies length, sets mtime with `filetime`, `fsync`, renames.
 
-`MtpEndpoint`: wraps one `Storage` and a root `RemotePath`. `read` uses `download_windowed(handle, ByteRange::From(offset), 8 MiB)` and yields each window as chunks. `write` uses `upload_with_progress`; on `UploadError { partial: Some(h) }` it deletes `h` before returning the error. `scan` uses `collect_objects_recursive` reporting objects found so far.
+`MtpEndpoint`: wraps one `Storage` and a root `RemotePath`. `read` uses `download_windowed(handle, ByteRange::From(offset), 4 MiB)` and yields each window as chunks. `write` uses `upload_with_progress`; on `UploadError { partial: Some(h) }` it deletes `h` before returning the error. `scan` uses `collect_objects_recursive` reporting objects found so far.
 
 ### 6.11 Resolver and stale handles
 
@@ -435,10 +435,10 @@ The executor never retries a write blindly. A lost response after `SendObjectInf
 
 ### 6.13 Cancellation state machine
 
-Downloads are windowed, so no MTP session is held between windows and dropping a `WindowedDownload` is safe by construction. That is the reason windowed is the default even though continuous transfers avoid one round-trip per 8 MiB.
+Downloads are windowed, so no MTP session is held between windows and dropping a `WindowedDownload` is safe by construction. That is the reason windowed is the default even though continuous transfers avoid one round-trip per 4 MiB.
 
 ```text
-Running ──Ctrl-C──> Draining: finish the current window (at most 8 MiB, about 80 ms)
+Running ──Ctrl-C──> Draining: finish the current window (at most 4 MiB, about 120 ms at USB 2.0)
 Draining ─────────> Persisting: flush the .mtpx-part, write the sidecar with bytes so far
 Persisting ───────> Reporting: emit Interrupted { remaining_files }, then Finished { report.interrupted = true }
 Reporting ────────> Closed: close the session cleanly, return Ok(report) with report.interrupted
@@ -627,7 +627,7 @@ MTP is one serial session per device. No per-file parallelism exists. Throughput
 
 - One recursive scan per side, plan in memory, no per-decision round-trips.
 - Overlapping USB reads with disk writes through a bounded channel and `spawn_blocking`.
-- 8 MiB windows: one extra round-trip per 8 MiB, about 1% at USB 2.0 rates, in exchange for safe cancellation.
+- 4 MiB windows: one extra round-trip per 4 MiB, about 1% at USB 2.0 rates, in exchange for safe cancellation and a cancel latency around 120 ms. Measured on a moto g52 over USB 2.0: 30 to 32 MB/s sustained.
 - Cached folder handles in the resolver so `mkdir` and uploads do not re-list parents.
 - `BufWriter` 1 MiB on local writes.
 
