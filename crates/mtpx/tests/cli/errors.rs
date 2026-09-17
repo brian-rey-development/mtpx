@@ -12,8 +12,22 @@ fn missing_remote_path_exits_5_with_a_hint() {
         .assert()
         .code(NOT_FOUND)
         .stderr(
-            predicate::str::contains("remote path not found")
-                .and(predicate::str::contains("mtpx ls")),
+            predicate::str::contains("remote path not found: /Nope")
+                .and(predicate::str::contains("`mtpx ls /`")),
+        );
+}
+
+#[test]
+fn a_typed_storage_prefix_stays_in_the_message_and_the_hint() {
+    let phone = Phone::with_two_photos();
+    phone
+        .mtpx()
+        .args(["ls", "internal:/DCIM/Nope"])
+        .assert()
+        .code(NOT_FOUND)
+        .stderr(
+            predicate::str::contains("remote path not found: internal:/DCIM/Nope")
+                .and(predicate::str::contains("`mtpx ls internal:/DCIM`")),
         );
 }
 

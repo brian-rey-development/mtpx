@@ -113,10 +113,12 @@ fn decide_file(
     }
 }
 
-/// Bytes a partial lets the copy skip; zero unless it came from this exact object and is incomplete.
+/// Bytes a partial lets the copy skip; zero unless it came from this exact object. A partial
+/// holding the whole file resumes at its size, so the copy only finalises it.
 fn resume_offset(file: &Entry, partial: Option<&PartialInfo>) -> u64 {
+    // `matches` checks the size; this only rejects a sidecar that outgrew the file it describes.
     partial
-        .filter(|partial| partial.fingerprint.matches(file) && partial.bytes < file.size)
+        .filter(|partial| partial.fingerprint.matches(file) && partial.bytes <= file.size)
         .map_or(0, |partial| partial.bytes)
 }
 
@@ -407,12 +409,26 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_holding_the_whole_file_or_more_is_ignored() {
-        for bytes in [100, 101] {
-            let partials = partials(vec![("a.bin", partial(100, bytes))]);
-            let plan = plan_resuming(vec![file("a.bin", 100)], vec![], &partials);
-            assert_eq!(plan.actions(), [copy_new("a.bin", 100, 0)]);
-        }
+    fn a_complete_partial_resumes_at_its_full_size() {
+        let partials = partials(vec![("a.bin", partial(100, 100))]);
+        let plan = plan_resuming(vec![file("a.bin", 100)], vec![], &partials);
+        assert_eq!(plan.actions(), [copy_new("a.bin", 100, 100)]);
+        assert_eq!(
+            plan.summary(),
+            PlanSummary {
+                files_to_copy: 1,
+                bytes_to_copy: 0,
+                resumable_bytes: 100,
+                to_skip: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_longer_than_the_file_is_ignored() {
+        let partials = partials(vec![("a.bin", partial(100, 101))]);
+        let plan = plan_resuming(vec![file("a.bin", 100)], vec![], &partials);
+        assert_eq!(plan.actions(), [copy_new("a.bin", 100, 0)]);
     }
 
     #[test]

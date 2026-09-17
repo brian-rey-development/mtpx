@@ -8,6 +8,8 @@ use mtpx_core::{DevicePath, DeviceSummary, Error, ExclusiveHolder, RelPath, Stor
 
 const NO_DEVICE_HELP: &str =
     "Unlock the phone and choose File transfer / MTP in its USB notification.";
+const DEVICE_UNRESPONSIVE_HELP: &str = "Unlock the phone, open the USB notification and choose \
+     File transfer (MTP). Charging-only mode answers nothing.";
 const EXCLUSIVE_ACCESS_MACOS_HELP: &str = "macOS claims MTP devices for Image Capture through \
      ptpcamerad. Run `pkill ptpcamerad` and retry. If Android File Transfer is installed, quit it.";
 const EXCLUSIVE_ACCESS_OTHER_HELP: &str = "Quit the application using the phone (Android File Transfer, a file manager, gphoto2) and \
@@ -37,6 +39,7 @@ fn help(error: &Error) -> Option<String> {
         Error::NoDevice => Some(NO_DEVICE_HELP.to_owned()),
         Error::ExclusiveAccess { holder } => Some(exclusive_access(holder.as_ref())),
         Error::PermissionDenied => Some(PERMISSION_DENIED_HELP.to_owned()),
+        Error::DeviceUnresponsive => Some(DEVICE_UNRESPONSIVE_HELP.to_owned()),
         Error::AmbiguousDevice(devices) => Some(ambiguous_device(devices)),
         Error::StorageRequired(storages) => Some(storage_required(storages)),
         Error::Conflicts(paths) => Some(conflicts(paths)),
@@ -111,7 +114,19 @@ fn remote_path_not_found(path: &DevicePath) -> String {
             .parent()
             .unwrap_or_else(mtpx_core::RemotePath::root),
     };
-    format!("Check the name with `mtpx ls {parent}`.")
+    format!(
+        "Check the name with `mtpx ls {}`.",
+        shell_argument(&parent.to_string())
+    )
+}
+
+/// Quotes an argument the shell would otherwise split into several or cut at a quote.
+fn shell_argument(argument: &str) -> String {
+    let needs_quoting = argument.contains(char::is_whitespace) || argument.contains('"');
+    if needs_quoting {
+        return format!("\"{}\"", argument.replace('"', "\\\""));
+    }
+    argument.to_owned()
 }
 
 #[cfg(test)]
@@ -202,10 +217,40 @@ mod tests {
     }
 
     #[test]
+    fn remote_path_not_found_quotes_a_parent_with_spaces() {
+        let path: DevicePath = "sd card:/My Photos/Nope".parse().unwrap();
+        let text = help(&Error::RemotePathNotFound(path)).unwrap();
+        assert_eq!(
+            text,
+            "Check the name with `mtpx ls \"sd card:/My Photos\"`."
+        );
+    }
+
+    #[test]
+    fn remote_path_not_found_escapes_a_quote_inside_the_parent() {
+        let path: DevicePath = "/My \"Photos\"/Nope".parse().unwrap();
+        let text = help(&Error::RemotePathNotFound(path)).unwrap();
+        assert_eq!(
+            text,
+            "Check the name with `mtpx ls \"/My \\\"Photos\\\"\"`."
+        );
+    }
+
+    #[test]
     fn not_a_directory_points_at_the_parent() {
         let path: DevicePath = "/DCIM/a.jpg".parse().unwrap();
         let text = help(&Error::NotADirectory(path)).unwrap();
         assert_eq!(text, NOT_A_DIRECTORY_HELP);
+    }
+
+    #[test]
+    fn an_unresponsive_device_is_told_how_to_enter_file_transfer_mode() {
+        let text = help(&Error::DeviceUnresponsive).unwrap();
+        assert_eq!(
+            text,
+            "Unlock the phone, open the USB notification and choose File transfer (MTP). \
+             Charging-only mode answers nothing."
+        );
     }
 
     #[test]

@@ -6,13 +6,15 @@ use crate::{
     ui::{bars::Bars, format, theme::Theme},
 };
 use mtpx_core::{Hint, PlanSummary, ProgressEvent, RelPath, Report, Side, SkipReason};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 
 /// Consumes the event channel until it closes and draws what it sees.
 pub struct Renderer {
     output: Drawing,
     theme: Theme,
+    /// When the command started, so the summary counts the scans as well as the transfer.
+    started: Instant,
     total_files: u64,
     done_files: u64,
     file_base: u64,
@@ -27,16 +29,17 @@ enum Drawing {
 }
 
 impl Renderer {
-    /// Drains `rx`, drawing each event; returns once the sender side is dropped.
-    pub async fn run(mut rx: Receiver<ProgressEvent>, ui: UiOptions) {
-        let mut renderer = Self::new(ui);
+    /// Drains `rx`, drawing each event; returns once the sender side is dropped. `started` is
+    /// when the command began, captured before the scans.
+    pub async fn run(mut rx: Receiver<ProgressEvent>, ui: UiOptions, started: Instant) {
+        let mut renderer = Self::new(ui, started);
         while let Some(event) = rx.recv().await {
             renderer.handle_batch(event);
         }
         renderer.clear();
     }
 
-    fn new(ui: UiOptions) -> Self {
+    fn new(ui: UiOptions, started: Instant) -> Self {
         let output = match ui.output {
             Output::Bars => Drawing::Bars(Bars::new()),
             Output::Lines => Drawing::Lines,
@@ -45,6 +48,7 @@ impl Renderer {
         Self {
             output,
             theme: Theme::new(ui.color),
+            started,
             total_files: 0,
             done_files: 0,
             file_base: 0,
@@ -197,7 +201,7 @@ impl Renderer {
 
     fn finished(&self, report: &Report) {
         self.clear();
-        let line = format::summary_line(report, self.remaining);
+        let line = format::summary_line(report, self.remaining, self.started.elapsed());
         let painted = if report.interrupted {
             self.theme.warn(&line)
         } else if report.failed.is_empty() {
@@ -280,7 +284,7 @@ mod tests {
             prompts: false,
             color: false,
         };
-        let mut renderer = Renderer::new(ui);
+        let mut renderer = Renderer::new(ui, Instant::now());
         let path = RelPath::new(["a.jpg"]).unwrap();
         renderer.handle_batch(ProgressEvent::ScanStarted { side: Side::Source });
         renderer.handle_batch(ProgressEvent::FileStarted {

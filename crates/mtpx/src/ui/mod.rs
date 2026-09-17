@@ -5,5 +5,6 @@ pub mod diagnostic;
 pub mod format;
 pub mod progress;
 pub mod prompt;
+pub mod stdout;
 pub mod table;
 pub mod theme;

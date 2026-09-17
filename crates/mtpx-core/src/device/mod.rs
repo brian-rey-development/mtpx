@@ -44,6 +44,7 @@ impl Device {
     /// # Errors
     /// `NoDevice` when nothing matches, `AmbiguousDevice` when `Only` finds several,
     /// `ExclusiveAccess` or `PermissionDenied` when the OS refuses the USB interface,
+    /// `DeviceUnresponsive` when the phone never answers the first command,
     /// `Disconnected` when the device was unplugged between listing and opening.
     pub async fn open(selector: &DeviceSelector) -> Result<Self> {
         let summary = discovery::select_device(discovery::list_devices()?, selector)?;
@@ -51,7 +52,7 @@ impl Device {
             Some(serial) if !serial.is_empty() => MtpDevice::open_by_serial(serial).await,
             _ => MtpDevice::open_by_location(summary.location_id).await,
         };
-        Self::load(opened.map_err(Error::from_mtp)?, summary).await
+        Self::load(answered(opened)?, summary).await
     }
 
     /// Opens an in-process virtual device backed by local directories and lists it as attached
@@ -72,7 +73,7 @@ impl Device {
     }
 
     async fn load(inner: MtpDevice, summary: DeviceSummary) -> Result<Self> {
-        let storages = inner.storages().await.map_err(Error::from_mtp)?;
+        let storages = answered(inner.storages().await)?;
         Ok(Self {
             inner,
             storages: storages.into_iter().map(Arc::new).collect(),
@@ -125,10 +126,7 @@ impl Device {
     ) -> Result<Snapshot> {
         let endpoint = self.endpoint(path).await?;
         if endpoint.is_file() {
-            return Err(Error::NotADirectory(DevicePath {
-                storage: StorageSelector::Named(endpoint.identity().storage.clone()),
-                path: path.path.clone(),
-            }));
+            return Err(Error::NotADirectory(path.clone()));
         }
         if !recursive {
             return endpoint.list(cancel).await;
@@ -149,7 +147,7 @@ impl Device {
 
     async fn endpoint(&self, path: &DevicePath) -> Result<MtpEndpoint> {
         let storage = self.select_storage(&path.storage)?;
-        MtpEndpoint::open(storage, path.path.clone(), self.serial()).await
+        MtpEndpoint::open(storage, path, self.serial()).await
     }
 
     fn select_storage(&self, selector: &StorageSelector) -> Result<Arc<Storage>> {
@@ -186,6 +184,15 @@ impl fmt::Debug for Device {
     }
 }
 
+/// A timeout while opening means the phone is not talking at all; mid-transfer it is retried
+/// instead, so only the open path maps it.
+fn answered<T>(outcome: std::result::Result<T, mtp_rs::Error>) -> Result<T> {
+    match outcome {
+        Err(mtp_rs::Error::Timeout) => Err(Error::DeviceUnresponsive),
+        other => other.map_err(Error::from_mtp),
+    }
+}
+
 fn storage_summary(index: usize, info: &StorageInfo) -> StorageSummary {
     StorageSummary {
         index,
@@ -199,6 +206,23 @@ fn storage_summary(index: usize, info: &StorageInfo) -> StorageSummary {
 fn is_named(info: &StorageInfo, name: &str) -> bool {
     let wanted = name.to_lowercase();
     info.description.to_lowercase() == wanted || info.volume_identifier.to_lowercase() == wanted
+}
+
+#[cfg(test)]
+mod answered_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::answered;
+    use crate::error::Error;
+
+    #[test]
+    fn a_timeout_on_open_is_device_unresponsive_and_the_rest_map_as_usual() {
+        let err = answered::<()>(Err(mtp_rs::Error::Timeout)).unwrap_err();
+        assert!(matches!(err, Error::DeviceUnresponsive), "{err:?}");
+        let err = answered::<()>(Err(mtp_rs::Error::Disconnected)).unwrap_err();
+        assert!(matches!(err, Error::Disconnected), "{err:?}");
+        assert!(answered(Ok(7)).is_ok_and(|value| value == 7));
+    }
 }
 
 #[cfg(all(test, feature = "virtual-device"))]
@@ -476,7 +500,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&err, Error::NotADirectory(path) if path.to_string() == "Internal Storage:/DCIM/photo.jpg"),
+                matches!(&err, Error::NotADirectory(path) if path.to_string() == "/DCIM/photo.jpg"),
                 "{recursive}: {err:?}"
             );
         }

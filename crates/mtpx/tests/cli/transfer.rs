@@ -67,6 +67,43 @@ fn sync_of_already_synced_files_reports_all_skips() {
 }
 
 #[test]
+fn sync_dry_run_of_already_synced_files_prints_no_skip_lines() {
+    let phone = Phone::with_two_photos();
+    phone
+        .mtpx()
+        .args(["sync", "/DCIM/Camera", phone.local_str()])
+        .assert()
+        .code(0);
+    phone
+        .mtpx()
+        .args(["sync", "/DCIM/Camera", phone.local_str(), "--dry-run"])
+        .assert()
+        .code(0)
+        .stdout("")
+        .stderr(predicate::str::contains("Plan: copy 0 files (0 B), skip 2"));
+}
+
+#[test]
+fn pull_dry_run_still_lists_a_conflict_skip() {
+    let phone = Phone::with_two_photos();
+    fs::write(phone.local().join("a.jpg"), CONFLICTING_LOCAL).unwrap();
+    fs::write(phone.local().join("b.jpg"), B_JPG).unwrap();
+    phone
+        .mtpx()
+        .args([
+            "pull",
+            "/DCIM/Camera",
+            phone.local_str(),
+            "--skip-existing",
+            "--dry-run",
+        ])
+        .assert()
+        .code(0)
+        .stdout("skip  a.jpg (conflict)\n")
+        .stderr(predicate::str::contains("Plan: copy 0 files (0 B), skip 2"));
+}
+
+#[test]
 fn pull_of_a_single_file_lands_it_under_local() {
     let phone = Phone::with_two_photos();
     phone

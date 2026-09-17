@@ -80,35 +80,43 @@ Fill in and paste into the CHANGELOG under "M1 hardware validation".
 
 | Step | Result | Notes |
 |---|---|---|
-| 1.1 | | |
-| 1.2 | | |
-| 1.3 | | |
-| 1.4 | | |
-| 2.1 | | |
-| 2.2 | | |
-| 2.3 | | |
-| 2.4 | | |
-| 2.5 | | |
-| 3.1 | | |
-| 3.2 | | |
-| 3.3 | | MB/s: |
-| 3.4 | | |
-| 3.5 | | |
-| 3.6 | | |
-| 4.1 | | |
-| 4.2 | | |
-| 4.3 | | |
-| 4.4 | | |
-| 4.5 | | |
-| 4.6 | | |
-| 5.1 | | |
-| 5.2 | | |
-| 5.3 | | |
-| 6 | | |
+| 1.1 | pass | motorola moto g52, ZY22FPNXWP, USB 2.0 High Speed |
+| 1.2 | pass | ptpcamerad was not running; the listing came through |
+| 1.3 | not run | needs hands on the cable |
+| 1.4 | finding | charging-only mode: 30 s wait, `operation timed out`, exit 1, no help (fix C) |
+| 2.1 | pass | 19 top-level directories with real modification times |
+| 2.2 | pass | sizes and dates present; `ls \| head` panicked on broken pipe (fix E) |
+| 2.3 | pass | 2,214 objects; the scan takes about 9 s (one metadata request per object in mtp-rs) |
+| 2.4 | finding | exit 5 but the message and hint carry the storage name (fix D) |
+| 2.5 | pass | exit 5 with the hint |
+| 3.1 | pass | covered by 3.5: size and mtime match the phone |
+| 3.2 | pass | actions on stdout, plan and SlowLink hint on stderr, directory not created |
+| 3.3 | pass | 12.5 GB in one interrupted run plus one resume, 30.1 MB/s average |
+| 3.4 | pass | 0 copied, 2,214 skipped; the summary said `Done in 0s` although the scans took ~9 s (fix F); dry run listed 2,214 skip lines (fix G) |
+| 3.5 | pass | no part files; VID_20251220_203158938.mp4 has the phone's mtime and 15,541,666 bytes |
+| 3.6 | not run |  |
+| 4.1 | pass | SIGINT at 36 s: `Interrupted after 36s: 457 copied, 1,757 remaining`, exit 130 within 300 ms |
+| 4.2 | finding | one part plus sidecar, but `bytes == size`: the interrupt landed after the last window of a one-window file (fix A) |
+| 4.3 | finding | the rerun completed (1,757 copied, 0 failed, no parts left) but re-copied the complete partial from zero (fix B) |
+| 4.4 | not run | needs hands on the cable |
+| 4.5 | not run |  |
+| 4.6 | not reproducible | the first SIGINT exits before a second one can be delivered; a SIGINT during the scan prints a bare `cancelled` (fix H) |
+| 5.1 | not run | covered by the CLI suite against the virtual device |
+| 5.2 | not run | same |
+| 5.3 | not run | same |
+| 6 | pass | 30 to 32 MB/s sustained on USB 2.0 High Speed, in range |
 
-## Findings so far
+## Findings (2026-09-16, first full run)
 
-- 2026-09-16, before the first full run: with the phone attached but not in File transfer
-  mode, `mtpx ls /` waits 30 s and prints `operation timed out` with exit 1 and no help.
-  The first PTP command never gets an answer. The CLI should say the phone is not
-  answering and how to fix it (unlock, choose File transfer), and exit 4.
+Eight fixes came out of this run, labelled A to H in the table:
+
+- A. A cancel that lands after a file's last window failed the file instead of finishing it.
+- B. A complete partial (`bytes == size`) was re-copied from zero instead of finalised.
+- C. An unresponsive phone (locked, charging-only) was a bare timeout with exit 1 and no help.
+- D. Error messages and hints carried the storage name the user never typed.
+- E. `mtpx ls | head` panicked on a broken pipe.
+- F. The summary timed only the transfer, so an all-skip run said `Done in 0s`.
+- G. A dry run listed every identical file as a `skip` line.
+- H. Ctrl-C during the scan printed a bare `cancelled`.
+
+Still to run by hand: 1.3 and 4.4/4.5 (cable), 3.6 (new photo).

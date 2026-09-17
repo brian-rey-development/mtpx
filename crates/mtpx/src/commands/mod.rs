@@ -7,13 +7,13 @@ mod transfer;
 
 use crate::{
     cli::{Cli, Command, Global},
-    ui::{prompt, theme},
+    ui::{prompt, stdout, theme},
 };
 use mtpx_core::{
     CancelToken, Device, DevicePath, Error, Plan, Report, Result, StorageSelector, StorageSummary,
     TransferOptions,
 };
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 
 /// Where progress goes, decided once from the flags and the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,22 @@ fn on_storage(path: &DevicePath, storages: &[StorageSummary], picked: usize) -> 
     }
 }
 
+/// Prints `text` on stdout. A reader that closed the pipe early, as `ls | head` does, is not a
+/// failure: the command goes on quietly and exits 0.
+///
+/// # Errors
+/// Any I/O failure other than `BrokenPipe`.
+pub fn print(text: &str) -> Result<()> {
+    quiet_when_gone(stdout::write(text))
+}
+
+fn quiet_when_gone(written: io::Result<()>) -> Result<()> {
+    match written {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(Error::from),
+    }
+}
+
 /// Runs `cli` to completion; `devices` needs no open device, everything else opens one first.
 pub async fn run(cli: Cli, cancel: CancelToken) -> Result<Outcome> {
     let ui = ui_options(&cli.global);
@@ -157,6 +173,15 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn print_swallows_a_broken_pipe_and_keeps_other_errors() {
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(matches!(quiet_when_gone(Err(broken)), Ok(())));
+        let other = io::Error::other("disk full");
+        assert!(matches!(quiet_when_gone(Err(other)), Err(Error::Io(_))));
+        assert!(matches!(quiet_when_gone(Ok(())), Ok(())));
+    }
 
     #[test]
     fn picked_storage_replaces_the_prefix_and_keeps_the_path() {

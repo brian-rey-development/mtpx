@@ -223,9 +223,13 @@ mod tests {
         device::test_support::*,
         error::{Error, Result},
         event::{ProgressEvent, Side},
-        internal::mtp::{
-            DOWNLOAD_WINDOW, PUMP_DEPTH,
-            test_support::{pseudo_random, rel, seed_tree},
+        internal::{
+            endpoint::Identity,
+            mtp::{
+                DOWNLOAD_WINDOW, PUMP_DEPTH,
+                test_support::{pseudo_random, rel, seed_tree},
+            },
+            partial::{Fingerprint, Sidecar, part_path, write_sidecar},
         },
         options::TransferOptions,
         plan::{Action, CopyReason, SkipReason},
@@ -482,6 +486,59 @@ mod tests {
         let report = job.run(&CancelToken::new(), &tx).await.unwrap();
         assert_eq!(report.copied, 2);
         assert_eq!(fs::read(local.path().join("a.jpg")).unwrap(), b"aaa");
+    }
+
+    /// A part holding every byte of the device's `a.jpg`, with the sidecar a completed but
+    /// unfinalised download would have left behind.
+    async fn seed_complete_partial(fixture: &Fixture, local: &Path) {
+        let listed = fixture
+            .device
+            .ls(&device_path(CAMERA), false, &CancelToken::new())
+            .await
+            .unwrap();
+        let source = listed.get(&rel("a.jpg")).unwrap();
+        let final_path = local.join("a.jpg");
+        fs::write(part_path(&final_path), b"aaa").unwrap();
+        let identity = Identity {
+            device_serial: fixture.serial.clone(),
+            storage: FIRST_STORAGE.into(),
+        };
+        let fingerprint = Fingerprint {
+            size: source.size,
+            modified: source.modified,
+        };
+        let sidecar = Sidecar::new(identity, &rel("a.jpg"), fingerprint, source.size);
+        write_sidecar(&final_path, &sidecar).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_complete_partial_is_finalised_without_reading_the_device() {
+        let fixture = open_device("finalise-complete-partial").await;
+        seed_tree(fixture.root());
+        let local = tempfile::tempdir().unwrap();
+        seed_complete_partial(&fixture, local.path()).await;
+        let (tx, mut rx) = events();
+        let opts = TransferOptions::pull();
+        let job = plan_remote(&fixture, CAMERA_FILE, local.path(), &opts, &tx)
+            .await
+            .unwrap();
+        assert_eq!(job.plan().summary().resumable_bytes, 3);
+        assert_eq!(job.plan().summary().bytes_to_copy, 0);
+        let report = job.run(&CancelToken::new(), &tx).await.unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(report.bytes, 0);
+        let seen = drain(&mut rx);
+        assert!(seen.contains(&ProgressEvent::FileStarted {
+            path: rel("a.jpg"),
+            size: 3,
+            resume_from: 3,
+        }));
+        assert_eq!(
+            count(&seen, |e| matches!(e, ProgressEvent::FileProgress { .. })),
+            0
+        );
+        assert_eq!(fs::read(local.path().join("a.jpg")).unwrap(), b"aaa");
+        assert_eq!(local_names(local.path()), ["a.jpg"]);
     }
 
     #[tokio::test]

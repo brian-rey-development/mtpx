@@ -32,6 +32,10 @@ pub enum Error {
     /// The OS refused to open the device for this user.
     #[error("permission denied opening the device")]
     PermissionDenied,
+    /// The phone is attached but its MTP side is not talking: the first command after opening
+    /// got no answer, which is what a locked phone or one in charging-only mode does.
+    #[error("the device did not answer")]
+    DeviceUnresponsive,
     /// The remote path does not exist on the selected storage.
     #[error("remote path not found: {0}")]
     RemotePathNotFound(DevicePath),

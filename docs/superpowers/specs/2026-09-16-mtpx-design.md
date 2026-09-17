@@ -586,7 +586,7 @@ Every line carries `"version": 1`. Field names are documented in `docs/cli.md`. 
 | 0 | success (sync with nothing to do is success) |
 | 1 | generic error |
 | 2 | usage error |
-| 3 | no device or ambiguous device |
+| 3 | no device, ambiguous device, or a device that does not answer |
 | 4 | device access denied (exclusive access, permissions) |
 | 5 | remote path or storage not found, storage required |
 | 6 | one or more transfers failed (summary printed) |

@@ -392,6 +392,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resume_equal_to_the_expected_size_with_an_empty_stream_finalises_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = endpoint(&dir);
+        write_valid_partial(&dir, "f.bin", "ZY22", b"whole", 5);
+        let outcome = local
+            .write(request("f.bin", 5, 5), stream(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(outcome, WriteOutcome { bytes: 5 });
+        let final_path = dir.path().join("f.bin");
+        assert_eq!(fs::read(&final_path).unwrap(), b"whole");
+        let mtime =
+            ModifiedTime::from_system(fs::metadata(&final_path).unwrap().modified().unwrap());
+        assert_eq!(mtime, at(1_700_000_000));
+        assert!(!part_path(&final_path).exists());
+        assert!(!sidecar_path(&final_path).exists());
+    }
+
+    #[tokio::test]
     async fn short_stream_is_a_length_mismatch_that_keeps_the_partial() {
         let dir = tempfile::tempdir().unwrap();
         let local = endpoint(&dir);

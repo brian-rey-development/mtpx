@@ -1,11 +1,11 @@
 //! `mtpx pull` and `mtpx sync`: plan, show, run, all through one progress renderer.
 
 use crate::{
-    commands::{Ctx, Outcome},
+    commands::{self, Ctx, Outcome},
     ui::{progress::Renderer, table},
 };
 use mtpx_core::{DevicePath, ProgressEvent, PullJob, Result, TransferOptions};
-use std::path::Path;
+use std::{path::Path, time::Instant};
 use tokio::sync::mpsc::{self, Sender};
 
 /// Deep enough that a burst of `FileProgress` never stalls the executor on the renderer.
@@ -19,10 +19,11 @@ pub async fn run(
     opts: &TransferOptions,
     dry_run: bool,
 ) -> Result<Outcome> {
+    let started = Instant::now();
     let (events, rx) = mpsc::channel(EVENTS_CAPACITY);
     // The renderer starts before `plan_pull` because the core awaits every non-progress event
     // send, so a receiver must already be draining.
-    let renderer = tokio::spawn(Renderer::run(rx, ctx.ui));
+    let renderer = tokio::spawn(Renderer::run(rx, ctx.ui, started));
     let outcome = execute(ctx, remote, local, opts, dry_run, &events).await;
     drop(events);
     if let Err(join_error) = renderer.await {
@@ -30,7 +31,7 @@ pub async fn run(
     }
     let outcome = outcome?;
     if let Outcome::DryRun(plan) = &outcome {
-        print!("{}", table::plan(plan));
+        commands::print(&table::plan(plan))?;
     }
     Ok(outcome)
 }

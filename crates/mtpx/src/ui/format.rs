@@ -99,19 +99,21 @@ pub fn plan_line(summary: &PlanSummary) -> String {
 }
 
 /// The one line that says how a transfer ended; `remaining` is what the plan still had left.
-/// The size and rate only appear when something was copied.
-pub fn summary_line(report: &Report, remaining: u64) -> String {
+/// `total` is how long the whole command took, scans included, while the average rate
+/// only counts the time the bytes were moving. The size and rate only appear when something
+/// was copied.
+pub fn summary_line(report: &Report, remaining: u64, total: Duration) -> String {
     if report.interrupted {
         return format!(
             "Interrupted after {}: {} copied, {} remaining, re-run to resume",
-            duration(report.elapsed),
+            duration(total),
             count(report.copied),
             count(remaining)
         );
     }
     format!(
         "Done in {}: {} copied{}, {} skipped, {} failed",
-        duration(report.elapsed),
+        duration(total),
         count(report.copied),
         copied_detail(report),
         count(report.skipped),
@@ -229,15 +231,33 @@ mod tests {
         report.skipped = 1_102;
         report.elapsed = Duration::from_secs(132);
         assert_eq!(
-            summary_line(&report, 0),
+            summary_line(&report, 0, Duration::from_secs(132)),
             "Done in 2m 12s: 182 copied (4.3 GB, 32.6 MB/s avg), 1,102 skipped, 0 failed"
         );
         report.interrupted = true;
         report.copied = 5;
         report.elapsed = Duration::from_secs(63);
         assert_eq!(
-            summary_line(&report, 177),
+            summary_line(&report, 177, Duration::from_secs(63)),
             "Interrupted after 1m 03s: 5 copied, 177 remaining, re-run to resume"
+        );
+    }
+
+    #[test]
+    fn summary_line_times_the_whole_command_but_rates_only_the_transfer() {
+        let mut report = Report::default();
+        report.copied = 182;
+        report.bytes = 4_300_000_000;
+        report.elapsed = Duration::from_secs(132);
+        let with_scans = Duration::from_secs(141);
+        assert_eq!(
+            summary_line(&report, 0, with_scans),
+            "Done in 2m 21s: 182 copied (4.3 GB, 32.6 MB/s avg), 0 skipped, 0 failed"
+        );
+        report.interrupted = true;
+        assert_eq!(
+            summary_line(&report, 3, with_scans),
+            "Interrupted after 2m 21s: 182 copied, 3 remaining, re-run to resume"
         );
     }
 
@@ -246,15 +266,15 @@ mod tests {
         let mut report = Report::default();
         report.skipped = 2;
         assert_eq!(
-            summary_line(&report, 0),
-            "Done in 0s: 0 copied, 2 skipped, 0 failed"
+            summary_line(&report, 0, Duration::from_secs(9)),
+            "Done in 9s: 0 copied, 2 skipped, 0 failed"
         );
         report
             .failed
             .push((RelPath::new(["a.jpg"]).unwrap(), "boom".into()));
         assert_eq!(
-            summary_line(&report, 0),
-            "Done in 0s: 0 copied, 2 skipped, 1 failed"
+            summary_line(&report, 0, Duration::from_secs(9)),
+            "Done in 9s: 0 copied, 2 skipped, 1 failed"
         );
     }
 }

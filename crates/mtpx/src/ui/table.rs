@@ -2,7 +2,9 @@
 
 use crate::ui::format;
 use jiff::{Timestamp, tz::TimeZone};
-use mtpx_core::{Action, DeviceSummary, EntryKind, ModifiedTime, Plan, Snapshot, UsbSpeed};
+use mtpx_core::{
+    Action, DeviceSummary, EntryKind, ModifiedTime, Plan, SkipReason, Snapshot, UsbSpeed,
+};
 
 const COLUMN_GAP: &str = "  ";
 const ABSENT: &str = "-";
@@ -48,28 +50,37 @@ pub fn ls(snapshot: &Snapshot, long: bool) -> String {
     render(&rows, &[1])
 }
 
-/// A plan, one action per line; the totals stay on stderr with the progress output.
+/// A plan, one line per action that would change something; the totals stay on stderr with
+/// the progress output. Files skipped as identical are left out, since a synced tree would
+/// otherwise drown the few real actions; a conflict skip stays, being a policy decision.
 pub fn plan(plan: &Plan) -> String {
     actions(plan.actions())
 }
 
 fn actions(actions: &[Action]) -> String {
-    actions.iter().map(action).collect()
+    actions.iter().filter_map(action).collect()
 }
 
-fn action(action: &Action) -> String {
+fn action(action: &Action) -> Option<String> {
     match action {
-        Action::Mkdir { path } => format!("mkdir {path}\n"),
+        Action::Mkdir { path } => Some(format!("mkdir {path}\n")),
         Action::Copy {
             path,
             size,
             resume_from,
             ..
-        } => format!("copy  {path} ({})\n", copy_detail(*size, *resume_from)),
+        } => Some(format!(
+            "copy  {path} ({})\n",
+            copy_detail(*size, *resume_from)
+        )),
+        Action::Skip {
+            reason: SkipReason::Identical,
+            ..
+        } => None,
         Action::Skip { path, reason } => {
-            format!("skip  {path} ({})\n", format::skip_reason(*reason))
+            Some(format!("skip  {path} ({})\n", format::skip_reason(*reason)))
         }
-        _ => String::new(),
+        _ => None,
     }
 }
 
@@ -172,7 +183,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
     use super::*;
-    use mtpx_core::{CopyReason, Entry, RelPath, SkipReason};
+    use mtpx_core::{CopyReason, Entry, RelPath};
 
     fn rel(path: &str) -> RelPath {
         RelPath::new(path.split('/')).unwrap()
@@ -256,8 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_lists_only_the_actions_one_line_each_with_resume_offsets() {
+    fn plan_lists_what_would_change_and_leaves_identical_files_out() {
         let listed = [
+            Action::Skip {
+                path: rel("DCIM/same.jpg"),
+                reason: SkipReason::Identical,
+            },
             Action::Mkdir { path: rel("DCIM") },
             Action::Copy {
                 path: rel("DCIM/a.jpg"),

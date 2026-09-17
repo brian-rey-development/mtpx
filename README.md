@@ -71,7 +71,7 @@ remain, and exits 130. A second Ctrl-C exits at once.
 | 0 | success, including a sync with nothing to do |
 | 1 | unexpected error |
 | 2 | usage error |
-| 3 | no device, or more than one and no `--device` |
+| 3 | no device, one that does not answer (locked or charging-only), or more than one and no `--device` |
 | 4 | the device is held by another process or the OS denied access |
 | 5 | remote path or storage not found |
 | 6 | some files failed; the summary lists them |

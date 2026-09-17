@@ -6,6 +6,7 @@ mod resolver;
 mod scan;
 
 use crate::{
+    device_path::DevicePath,
     entry::Snapshot,
     error::{Error, Result},
     internal::endpoint::{ByteStream, Endpoint, Identity, ScanResult, WriteOutcome, WriteRequest},
@@ -40,18 +41,20 @@ pub struct MtpEndpoint {
 }
 
 impl MtpEndpoint {
-    /// Locates `root` on `storage`, walking one folder per segment. `root` may name a folder or
-    /// a file; a file endpoint scans and reads that one file under its parent.
+    /// Locates `path` on `storage`, which the caller already picked from `path.storage`,
+    /// walking one folder per segment. It may name a folder or a file; a file endpoint scans
+    /// and reads that one file under its parent. Errors carry `path` as given, so a message
+    /// shows the selector the user typed rather than the storage's own name.
     ///
     /// # Errors
     /// `RemotePathNotFound` when a segment is missing, `NotADirectory` when a segment before the
     /// last is a file, or the first listing error.
     pub async fn open(
         storage: Arc<Storage>,
-        root: RemotePath,
+        path: &DevicePath,
         device_serial: &str,
     ) -> Result<Self> {
-        let target = open::locate_root(&storage, &root).await?;
+        let target = open::locate_root(&storage, path).await?;
         let identity = Identity {
             device_serial: device_serial.to_owned(),
             storage: storage.info().description.clone(),
@@ -59,7 +62,7 @@ impl MtpEndpoint {
         Ok(Self {
             resolver: Resolver::new(Arc::clone(&storage), target.folder),
             storage,
-            root,
+            root: path.path.clone(),
             file: target.file,
             identity,
         })
@@ -170,7 +173,8 @@ impl fmt::Debug for MtpEndpoint {
 /// Forwards windows until EOF, an error, a dropped receiver, or a cancel seen between windows.
 async fn pump(mut download: WindowedDownload, cancel: CancelToken, tx: Sender<Result<Bytes>>) {
     loop {
-        let item = if cancel.is_cancelled() {
+        // A cancel after the last window would fail a file whose every byte already landed.
+        let item = if cancel.is_cancelled() && download.offset() < download.size() {
             Err(Error::Cancelled)
         } else {
             match download.next_window().await {
@@ -215,7 +219,7 @@ mod pump_tests {
 pub mod test_support {
     #![allow(clippy::unwrap_used)]
 
-    use crate::path::{RelPath, RemotePath};
+    use crate::{device_path::DevicePath, path::RelPath};
     use mtp_rs::{MtpDevice, Storage, VirtualDeviceConfig, VirtualStorageConfig};
     use std::{fs, path::Path, sync::Arc, time::Duration};
     use tempfile::TempDir;
@@ -270,8 +274,8 @@ pub mod test_support {
         RelPath::new(path.split('/')).unwrap()
     }
 
-    pub fn remote(path: &str) -> RemotePath {
-        RemotePath::parse(path).unwrap()
+    pub fn remote(path: &str) -> DevicePath {
+        path.parse().unwrap()
     }
 
     pub fn pseudo_random(len: usize) -> Vec<u8> {
@@ -291,17 +295,15 @@ pub mod test_support {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
-    use super::{DOWNLOAD_WINDOW, MtpEndpoint, PUMP_DEPTH, test_support::*};
+    use super::{DOWNLOAD_WINDOW, MtpEndpoint, PUMP_DEPTH, pump, test_support::*};
     use crate::{
-        device_path::StorageSelector,
         entry::EntryKind,
         error::Error,
         internal::endpoint::{Endpoint, WriteRequest},
-        path::RemotePath,
     };
     use bytes::Bytes;
     use futures::StreamExt;
-    use mtp_rs::CancelToken;
+    use mtp_rs::{ByteRange, CancelToken};
     use std::{
         fs,
         path::Path,
@@ -310,8 +312,11 @@ mod tests {
             atomic::{AtomicU64, Ordering},
         },
     };
+    use tokio::sync::mpsc;
 
     const LARGE_FILE: usize = 9 * 1024 * 1024;
+    /// A single window, so a cancel can only land after the last byte.
+    const SMALL_FILE: usize = 1024;
     /// More windows than the pump can hold buffered plus in flight once the token is set,
     /// so the stream cannot reach EOF before the cancel is observed.
     const CANCEL_FILE: usize = (PUMP_DEPTH + 4) * DOWNLOAD_WINDOW as usize;
@@ -319,7 +324,7 @@ mod tests {
     async fn open_at(test_name: &str, root: &str) -> (MtpEndpoint, tempfile::TempDir, String) {
         let (storage, dir, serial) = open_device(test_name).await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, remote(root), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote(root), &serial)
             .await
             .unwrap();
         (endpoint, dir, serial)
@@ -356,39 +361,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_of_a_missing_folder_is_remote_path_not_found() {
+    async fn open_of_a_missing_folder_is_remote_path_not_found_as_typed() {
         let (storage, dir, serial) = open_device("open-missing").await;
         seed_tree(dir.path());
-        let root = remote("/DCIM/Missing");
-        let err = MtpEndpoint::open(storage, root.clone(), &serial)
-            .await
-            .unwrap_err();
-        let Error::RemotePathNotFound(device_path) = err else {
-            panic!("{err:?}");
-        };
-        assert_eq!(
-            device_path.storage,
-            StorageSelector::Named(STORAGE_DESCRIPTION.into())
-        );
-        assert_eq!(device_path.path, root);
+        for typed in ["/DCIM/Missing", "sd:/DCIM/Missing", "1:/DCIM/Missing"] {
+            let root = remote(typed);
+            let err = MtpEndpoint::open(Arc::clone(&storage), &root, &serial)
+                .await
+                .unwrap_err();
+            let Error::RemotePathNotFound(device_path) = err else {
+                panic!("{typed}: {err:?}");
+            };
+            assert_eq!(device_path, root);
+            assert_eq!(device_path.to_string(), typed);
+        }
     }
 
     #[tokio::test]
-    async fn open_through_a_file_is_not_a_directory() {
+    async fn open_through_a_file_is_not_a_directory_as_typed() {
         let (storage, dir, serial) = open_device("open-through-file").await;
         seed_tree(dir.path());
         let root = remote("/DCIM/photo.jpg/nested");
-        let err = MtpEndpoint::open(storage, root.clone(), &serial)
+        let err = MtpEndpoint::open(storage, &root, &serial)
             .await
             .unwrap_err();
         let Error::NotADirectory(device_path) = err else {
             panic!("{err:?}");
         };
-        assert_eq!(device_path.path, root);
-        assert_eq!(
-            device_path.to_string(),
-            "Internal Storage:/DCIM/photo.jpg/nested"
-        );
+        assert_eq!(device_path, root);
+        assert_eq!(device_path.to_string(), "/DCIM/photo.jpg/nested");
     }
 
     #[tokio::test]
@@ -411,7 +412,7 @@ mod tests {
     async fn a_file_directly_under_the_storage_root_opens_scans_and_reads() {
         let (storage, dir, serial) = open_device("open-root-file").await;
         fs::write(dir.path().join("photo.jpg"), b"photo").unwrap();
-        let endpoint = MtpEndpoint::open(storage, remote("/photo.jpg"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/photo.jpg"), &serial)
             .await
             .unwrap();
         assert!(endpoint.is_file());
@@ -516,7 +517,7 @@ mod tests {
     async fn read_of_an_empty_file_ends_immediately() {
         let (storage, dir, serial) = open_device("read-empty").await;
         fs::write(dir.path().join("empty.bin"), b"").unwrap();
-        let endpoint = MtpEndpoint::open(storage, RemotePath::root(), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let chunks = read_all(&endpoint, "empty.bin", 0).await;
@@ -524,11 +525,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_of_an_empty_file_ends_cleanly_even_when_already_cancelled() {
+        let (storage, dir, serial) = open_device("read-empty-cancelled").await;
+        fs::write(dir.path().join("empty.bin"), b"").unwrap();
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
+            .await
+            .unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let items: Vec<_> = endpoint
+            .read(&rel("empty.bin"), 0, &cancel)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[tokio::test]
     async fn read_of_a_large_file_arrives_in_bounded_windows() {
         let (storage, dir, serial) = open_device("read-large").await;
         let content = pseudo_random(LARGE_FILE);
         fs::write(dir.path().join("big.bin"), &content).unwrap();
-        let endpoint = MtpEndpoint::open(storage, RemotePath::root(), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let chunks = read_all(&endpoint, "big.bin", 0).await;
@@ -541,7 +560,7 @@ mod tests {
     async fn read_ends_with_cancelled_once_the_token_is_set_between_windows() {
         let (storage, dir, serial) = open_device("read-cancel").await;
         fs::write(dir.path().join("big.bin"), pseudo_random(CANCEL_FILE)).unwrap();
-        let endpoint = MtpEndpoint::open(storage, RemotePath::root(), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let cancel = CancelToken::new();
@@ -554,6 +573,36 @@ mod tests {
         assert!(matches!(last, Err(Error::Cancelled)), "{last:?}");
         assert!(before.iter().all(Result::is_ok));
         assert!(before.len() <= PUMP_DEPTH + 1, "{}", before.len());
+    }
+
+    /// The channel is full before the pump starts, so it blocks on the first send and looks
+    /// at the token only after the whole file was read; `read` alone cannot pin that order.
+    #[tokio::test]
+    async fn a_cancel_after_the_last_window_ends_the_read_cleanly() {
+        let (storage, dir, serial) = open_device("read-cancel-at-eof").await;
+        fs::write(dir.path().join("small.bin"), pseudo_random(SMALL_FILE)).unwrap();
+        let endpoint = MtpEndpoint::open(Arc::clone(&storage), &remote("/"), &serial)
+            .await
+            .unwrap();
+        let download = endpoint
+            .resolver
+            .with_handle(&rel("small.bin"), |handle| {
+                storage.download_windowed(handle, ByteRange::From(0), DOWNLOAD_WINDOW)
+            })
+            .await
+            .unwrap();
+        let cancel = CancelToken::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::new())).await.unwrap();
+        let pump = tokio::spawn(pump(download, cancel.clone(), tx));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(rx.recv().await.unwrap().unwrap().is_empty());
+        let whole = rx.recv().await.unwrap().unwrap();
+        assert_eq!(whole.len(), SMALL_FILE);
+        let next = rx.recv().await;
+        assert!(next.is_none(), "{next:?}");
+        pump.await.unwrap();
     }
 
     #[tokio::test]

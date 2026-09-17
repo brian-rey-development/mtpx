@@ -1,9 +1,8 @@
 //! Locates the object a remote path names, walking one folder per segment from the storage root.
 
 use crate::{
-    device_path::{DevicePath, StorageSelector},
+    device_path::DevicePath,
     error::{Error, Result},
-    path::RemotePath,
 };
 use mtp_rs::{ObjectHandle, ObjectInfo, Storage};
 
@@ -31,20 +30,21 @@ impl Target {
     }
 }
 
-/// Walks `root` one folder per segment from the storage root; the last segment may be a file.
+/// Walks `root.path` one folder per segment from the storage root; the last segment may be a
+/// file. Errors carry `root` as the caller wrote it, storage selector included.
 ///
 /// # Errors
 /// `RemotePathNotFound` when a segment is missing, `NotADirectory` when a segment before the
 /// last is a file, or the first listing error.
-pub(super) async fn locate_root(storage: &Storage, root: &RemotePath) -> Result<Target> {
+pub(super) async fn locate_root(storage: &Storage, root: &DevicePath) -> Result<Target> {
     let mut folder = None;
-    let Some((last, folders)) = root.segments().split_last() else {
+    let Some((last, folders)) = root.path.segments().split_last() else {
         return Ok(Target { folder, file: None });
     };
     for segment in folders {
         let found = find_child(storage, folder, segment, root).await?;
         if !found.is_folder() {
-            return Err(Error::NotADirectory(device_path(storage, root)));
+            return Err(Error::NotADirectory(root.clone()));
         }
         folder = Some(found.handle);
     }
@@ -56,7 +56,7 @@ async fn find_child(
     storage: &Storage,
     parent: Option<ObjectHandle>,
     name: &str,
-    root: &RemotePath,
+    root: &DevicePath,
 ) -> Result<ObjectInfo> {
     let listing = storage
         .collect_objects(parent)
@@ -66,12 +66,5 @@ async fn find_child(
         .objects
         .into_iter()
         .find(|o| o.filename == name)
-        .ok_or_else(|| Error::RemotePathNotFound(device_path(storage, root)))
-}
-
-fn device_path(storage: &Storage, root: &RemotePath) -> DevicePath {
-    DevicePath {
-        storage: StorageSelector::Named(storage.info().description.clone()),
-        path: root.clone(),
-    }
+        .ok_or_else(|| Error::RemotePathNotFound(root.clone()))
 }

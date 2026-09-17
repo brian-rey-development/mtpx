@@ -2,7 +2,7 @@
 
 use crate::{
     cli::LsArgs,
-    commands::{Ctx, Outcome, Output},
+    commands::{self, Ctx, Outcome, Output},
     ui::{format, table},
 };
 use mtpx_core::{DevicePath, Result, Snapshot};
@@ -11,7 +11,7 @@ use mtpx_core::{DevicePath, Result, Snapshot};
 /// unless quiet.
 pub async fn run(ctx: &Ctx, args: &LsArgs) -> Result<Outcome> {
     let snapshot = list(ctx, &ctx.resolve(&args.path), args.recursive).await?;
-    print!("{}", table::ls(&snapshot, args.long));
+    commands::print(&table::ls(&snapshot, args.long))?;
     let skipped = snapshot.skipped().len() as u64;
     if skipped > 0 && ctx.ui.output != Output::Quiet {
         eprintln!(

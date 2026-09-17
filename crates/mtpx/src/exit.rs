@@ -18,7 +18,7 @@ pub const INTERRUPTED: u8 = 130;
 /// The exit code for a command that failed with `error`.
 pub fn code_for_error(error: &Error) -> ExitCode {
     let code = match error {
-        Error::NoDevice | Error::AmbiguousDevice(_) => NO_DEVICE,
+        Error::NoDevice | Error::AmbiguousDevice(_) | Error::DeviceUnresponsive => NO_DEVICE,
         Error::ExclusiveAccess { .. } | Error::PermissionDenied => ACCESS_DENIED,
         Error::RemotePathNotFound(_)
         | Error::NotADirectory(_)
@@ -69,6 +69,7 @@ mod tests {
         let cases = [
             (Error::NoDevice, NO_DEVICE),
             (Error::AmbiguousDevice(vec![]), NO_DEVICE),
+            (Error::DeviceUnresponsive, NO_DEVICE),
             (Error::PermissionDenied, ACCESS_DENIED),
             (Error::RemotePathNotFound(path()), NOT_FOUND),
             (Error::NotADirectory(path()), NOT_FOUND),

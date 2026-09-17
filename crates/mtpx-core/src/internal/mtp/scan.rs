@@ -270,7 +270,7 @@ mod tests {
     async fn scan_lists_the_whole_tree_sorted_with_kinds_and_sizes() {
         let (storage, dir, serial) = open_device("scan-tree").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let found = Arc::new(AtomicU64::new(0));
@@ -315,7 +315,7 @@ mod tests {
     async fn scan_from_a_non_root_root_yields_paths_relative_to_it() {
         let (storage, dir, serial) = open_device("scan-subroot").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, remote("/DCIM"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/DCIM"), &serial)
             .await
             .unwrap();
         let result = endpoint
@@ -344,7 +344,7 @@ mod tests {
     async fn scan_with_a_set_token_is_cancelled() {
         let (storage, dir, serial) = open_device("scan-cancelled").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let cancel = CancelToken::new();
@@ -357,7 +357,7 @@ mod tests {
     async fn scan_stops_with_cancelled_when_the_token_is_set_mid_walk() {
         let (storage, dir, serial) = open_device("scan-cancel-mid-walk").await;
         seed_tree(dir.path());
-        let endpoint = MtpEndpoint::open(storage, remote("/"), &serial)
+        let endpoint = MtpEndpoint::open(storage, &remote("/"), &serial)
             .await
             .unwrap();
         let cancel = CancelToken::new();

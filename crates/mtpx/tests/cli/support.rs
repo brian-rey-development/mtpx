@@ -2,7 +2,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::{fs, path::Path};
+use std::{fs, path::Path, process};
 use tempfile::TempDir;
 
 pub const A_JPG: &[u8] = b"a thirty byte long photo file!";
@@ -55,6 +55,15 @@ impl Phone {
     /// `mtpx --virtual <backing> --no-color`, ready for a subcommand.
     pub fn mtpx(&self) -> Command {
         let mut cmd = Command::cargo_bin("mtpx").unwrap();
+        cmd.arg("--virtual")
+            .arg(self.backing.path())
+            .arg("--no-color");
+        cmd
+    }
+
+    /// The same invocation as a plain process, for tests that drive the pipes themselves.
+    pub fn mtpx_process(&self) -> process::Command {
+        let mut cmd = process::Command::new(env!("CARGO_BIN_EXE_mtpx"));
         cmd.arg("--virtual")
             .arg(self.backing.path())
             .arg("--no-color");
