@@ -258,10 +258,10 @@ mod tests {
 
     #[test]
     fn report_sanitizes_a_device_supplied_name_in_the_message() {
-        let path = RelPath::new(["\x1b[2Jx.jpg"]).unwrap();
+        let path = RelPath::new(["photo\u{202E}gpj.exe"]).unwrap();
         let rendered = format!("{:?}", report(&Error::SourceVanished(path)));
-        assert!(rendered.contains("\u{FFFD}[2Jx.jpg"), "{rendered}");
-        assert!(!rendered.contains("\x1b[2J"), "{rendered}");
+        assert!(rendered.contains("photo\u{FFFD}gpj.exe"), "{rendered}");
+        assert!(!rendered.contains('\u{202E}'), "{rendered}");
     }
 
     #[test]

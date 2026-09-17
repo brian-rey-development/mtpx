@@ -488,11 +488,11 @@ mod tests {
 
     #[test]
     fn a_failed_file_line_is_terminal_safe() {
-        let path = RelPath::new(["\x1b[2Jx.jpg"]).unwrap();
-        let line = failed_line(&path, "source vanished: \x1b[2Jx.jpg", false);
+        let path = RelPath::new(["photo\u{202E}gpj.exe"]).unwrap();
+        let line = failed_line(&path, "source vanished: photo\u{202E}gpj.exe", false);
         assert_eq!(
             line,
-            "failed \u{FFFD}[2Jx.jpg: source vanished: \u{FFFD}[2Jx.jpg"
+            "failed photo\u{FFFD}gpj.exe: source vanished: photo\u{FFFD}gpj.exe"
         );
         assert!(failed_line(&path, "timed out", true).starts_with("retrying "));
     }

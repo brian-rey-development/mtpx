@@ -52,15 +52,15 @@ fn ls_long_prints_kind_size_and_name() {
 }
 
 #[test]
-fn ls_neutralizes_control_characters_in_device_names() {
+fn ls_neutralizes_hostile_characters_in_device_names() {
     let phone = Phone::empty();
-    phone.seed("DCIM/a\x1b[31mRED\x1b[0m.jpg", b"x");
+    phone.seed("DCIM/photo\u{202E}gpj.exe", b"x");
     phone
         .mtpx()
         .args(["ls", "/DCIM"])
         .assert()
         .code(0)
-        .stdout("a\u{FFFD}[31mRED\u{FFFD}[0m.jpg\n");
+        .stdout("photo\u{FFFD}gpj.exe\n");
 }
 
 /// Returns the directory name the files were seeded under.

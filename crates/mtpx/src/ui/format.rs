@@ -267,9 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn paths_are_shown_with_control_characters_neutralized() {
+    fn paths_are_shown_with_hostile_characters_neutralized() {
         assert_eq!(path(&rel("DCIM/a.jpg")), "DCIM/a.jpg");
-        assert_eq!(path(&rel("\x1b[2Jx.jpg")), "\u{FFFD}[2Jx.jpg");
+        assert_eq!(path(&rel("photo\u{202E}gpj.exe")), "photo\u{FFFD}gpj.exe");
     }
 
     #[test]

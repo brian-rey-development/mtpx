@@ -11,9 +11,10 @@ use std::{
     process::{Child, Stdio},
 };
 
-/// A name that would retitle or clear a terminal if printed raw.
-const ESCAPED_NAME: &str = "a\x1b[31mRED\x1b[0m.jpg";
-const ESCAPED_NAME_SHOWN: &str = "a\u{FFFD}[31mRED\u{FFFD}[0m.jpg";
+/// A right-to-left override makes a terminal show this as `photoexe.jpg`; unlike ESC it is a
+/// legal file name on every host, so the test runs everywhere.
+const HOSTILE_NAME: &str = "photo\u{202E}gpj.exe";
+const HOSTILE_NAME_SHOWN: &str = "photo\u{FFFD}gpj.exe";
 /// Enough progress lines to overflow a 64 KiB pipe buffer, so the writer sees the reader leave.
 const MANY_FILES: usize = 600;
 const LONG_DIR_NAME_LEN: usize = 200;
@@ -266,26 +267,26 @@ fn quiet_still_reports_objects_the_device_refused_to_describe() {
 }
 
 #[test]
-fn progress_and_the_plan_neutralize_control_characters_in_device_names() {
+fn progress_and_the_plan_neutralize_hostile_characters_in_device_names() {
     let phone = Phone::empty();
-    phone.seed(&format!("DCIM/{ESCAPED_NAME}"), b"x");
+    phone.seed(&format!("DCIM/{HOSTILE_NAME}"), b"x");
     phone
         .mtpx()
         .args(["pull", "/DCIM", phone.local_str(), "--dry-run"])
         .assert()
         .code(0)
-        .stdout(format!("copy  {ESCAPED_NAME_SHOWN} (1 B)\n"));
+        .stdout(format!("copy  {HOSTILE_NAME_SHOWN} (1 B)\n"));
     phone
         .mtpx()
         .args(["pull", "/DCIM", phone.local_str()])
         .assert()
         .code(0)
         .stderr(
-            predicate::str::contains(format!("copying {ESCAPED_NAME_SHOWN} (1 B)\n"))
+            predicate::str::contains(format!("copying {HOSTILE_NAME_SHOWN} (1 B)\n"))
                 .and(predicate::str::contains(format!(
-                    "copied {ESCAPED_NAME_SHOWN} ("
+                    "copied {HOSTILE_NAME_SHOWN} ("
                 )))
-                .and(predicate::str::contains("\x1b[").not()),
+                .and(predicate::str::contains('\u{202E}').not()),
         );
 }
 

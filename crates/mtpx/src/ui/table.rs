@@ -320,28 +320,27 @@ mod tests {
     }
 
     #[test]
-    fn plan_lines_neutralize_control_characters_in_device_names() {
+    fn plan_lines_neutralize_hostile_characters_in_device_names() {
         let listed = [
             Action::Mkdir {
-                path: rel("\x1b[2JDCIM"),
+                path: rel("\u{202E}DCIM"),
             },
             Action::Copy {
-                path: rel("DCIM/\x1b[31ma.jpg"),
+                path: rel("DCIM/\u{2028}a.jpg"),
                 size: 1,
                 modified: None,
                 resume_from: 0,
                 reason: CopyReason::New,
             },
             Action::Skip {
-                path: rel("DCIM/\x07c.jpg"),
+                path: rel("DCIM/\u{200F}c.jpg"),
                 reason: SkipReason::Conflict,
             },
         ];
         let text = actions(&listed);
-        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
         assert_eq!(
             text,
-            "mkdir \u{FFFD}[2JDCIM\ncopy  DCIM/\u{FFFD}[31ma.jpg (1 B)\nskip  DCIM/\u{FFFD}c.jpg (conflict)\n"
+            "mkdir \u{FFFD}DCIM\ncopy  DCIM/\u{FFFD}a.jpg (1 B)\nskip  DCIM/\u{FFFD}c.jpg (conflict)\n"
         );
     }
 }
