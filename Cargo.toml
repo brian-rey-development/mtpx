@@ -13,7 +13,7 @@ authors = ["Brian Rey"]
 [workspace.dependencies]
 mtpx-core = { path = "crates/mtpx-core", version = "0.1.0" }
 
-mtp-rs = { version = "0.32", features = ["tracing"] }
+mtp-rs = { version = "0.33", features = ["tracing"] }
 tokio = "1.53"
 tokio-stream = "0.1"
 futures = "0.3"
